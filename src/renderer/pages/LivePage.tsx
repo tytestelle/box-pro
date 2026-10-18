@@ -1,3 +1,4 @@
+‎src/renderer/pages/LivePage.tsx‎
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import Hls from 'hls.js';
