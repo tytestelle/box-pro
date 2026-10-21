@@ -137,6 +137,8 @@ function LiveVideoPlayer({
         return;
       }
 
+      let hasPlayed = false; // 记录此次实例是否真正播放过
+
       try {
         const player = mpegts.createPlayer(
           {
@@ -148,9 +150,14 @@ function LiveVideoPlayer({
           },
           {
             enableWorker: false,
-            enableStashBuffer: false,
+            enableStashBuffer: true, // ★ 开启缓冲池，抗丢包
+            stashInitialSize: 1024, 
             lazyLoad: false,
             autoCleanupSourceBuffer: true,
+            fixAudioTimestampGap: true, // ★ 核心修复：强行修复音视频时间戳断层
+            liveBufferLatencyChasing: true, // ★ 核心修复：自动追帧，防止延迟累积
+            liveBufferLatencyMaxLatency: 3.0,
+            liveBufferLatencyMinRemain: 0.5,
           },
         );
         mpegtsRef.current = player;
@@ -165,7 +172,7 @@ function LiveVideoPlayer({
           const infoStr = String(errDetail || '');
           const combined = `${typeStr} ${infoStr} ${JSON.stringify(errInfo || {})}`.toLowerCase();
 
-          // 强制销毁播放器，并清空 video 元素，释放底层网络句柄
+          // 强制销毁并清理 video 元素，释放硬解资源
           try { player.destroy(); } catch {}
           if (mpegtsRef.current === player) mpegtsRef.current = null;
           try { v.removeAttribute('src'); v.load(); } catch {}
@@ -173,17 +180,24 @@ function LiveVideoPlayer({
           // 1. 处理 503 (服务端连接池占满)
           if (combined.includes('503') || combined.includes('client limit')) {
             cbRef.current.onVideoError('服务器连接数已满 (503)，请稍后点击重试，或切换其他线路');
-            return; // ★ 遇到 503 绝不自动重试，防止把服务器彻底打死
+            return;
           }
 
-          // 2. 处理解码器崩溃 (MediaMSEError)
+          // 2. 处理解码崩溃 (MediaMSEError)
           if (combined.includes('mediaerror') || combined.includes('media_error') || combined.includes('appendbuffer')) {
-            retryCountRef.current++;
-            if (retryCountRef.current > 2) {
-              cbRef.current.onVideoError('该频道解码频繁崩溃，请尝试切换线路');
+            // 如果从未真正播放过（超过阈值），大概率是编码不支持 (如 H.265)
+            if (!hasPlayed) {
+              cbRef.current.onVideoError('解码失败，该频道可能是 H.265 编码或视频源已损坏，无法播放');
               return;
             }
-            cbRef.current.onVideoError(`解码崩溃，5 秒后自动重试 (${retryCountRef.current}/2)...`);
+
+            retryCountRef.current++;
+            if (retryCountRef.current > 3) {
+              cbRef.current.onVideoError('该频道频繁解码崩溃，已停止重试，请切换线路');
+              return;
+            }
+            
+            cbRef.current.onVideoError(`解码崩溃，5 秒后自动重试 (${retryCountRef.current}/3)...`);
             setTimeout(() => {
               if (!destroyed) void playMpegts(type, sourceUrl);
             }, 5000);
@@ -193,13 +207,15 @@ function LiveVideoPlayer({
           // 3. 其他网络或协议错误
           let hint = '';
           if (combined.includes('cross-origin') || combined.includes('cors')) {
-            hint = '（CORS 跨域被拦截）';
+            hint = '（CORS 跨域被拦截，请配置主进程放行）';
           }
           cbRef.current.onVideoError(`播放失败 [${typeStr}] ${infoStr} ${hint}`);
         });
 
+        // 监听解码信息事件（播放成功）
         player.on('mediaInfo', () => {
           if (destroyed) return;
+          hasPlayed = true;
           retryCountRef.current = 0; 
           cbRef.current.onVideoError(''); 
         });
