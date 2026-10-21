@@ -1,5 +1,3 @@
-‎src/renderer/pages/LivePage.tsx‎
-
 import { useEffect, useRef, useState, useCallback } from 'react';
 import Hls from 'hls.js';
 import { client } from '../api/client';
@@ -23,15 +21,38 @@ function saveLiveMem(m: LiveMem): void {
   try { localStorage.setItem(LIVE_MEM_KEY, JSON.stringify(m)); } catch { /* ignore */ }
 }
 
-type EpgStatus = 'idle' | 'loading' | 'ok' | 'empty' | 'error';
+/**
+ * ★ 2026-10-21：URL 规范化
+ *   IPTV m3u 里经常在 URL 末尾附加 `$自定义标签`（如 `$组播超高清`），
+ *   原样拿去请求会拼出一个不存在的路径，必须先剥离。
+ */
+function sanitizeUrl(raw: string): string {
+  const s = (raw || '').trim();
+  const i = s.indexOf('$');
+  return i >= 0 ? s.slice(0, i).trim() : s;
+}
+
+type StreamKind = 'hls' | 'flv' | 'ts' | 'native' | 'unknown';
 
 class StreamDetector {
-  static async detect(url: string): Promise<'hls' | 'flv' | 'ts' | 'native' | 'unknown'> {
-    const lower = url.toLowerCase();
+  static async detect(rawUrl: string): Promise<StreamKind> {
+    const url = sanitizeUrl(rawUrl);
+    let lower = url.toLowerCase();
+    try { lower = decodeURIComponent(lower); } catch { /* ignore */ }
+
+    // ★ 2026-10-21：识别 HTTP 代理的 UDP/RTP 组播地址
+    //   形如 http://36.235.101.41:8022/udp/224.1.4.215:11111
+    //   服务端返回的是连续 MPEG-TS 裸流，必须交给 mpegts.js 而不是 hls.js。
+    if (/\/(udp|rtp|rtsp|multicast)\//.test(lower)) return 'ts';
+
     if (lower.includes('.m3u8')) return 'hls';
     if (lower.includes('.flv')) return 'flv';
     if (/\.ts(\?|#|$)/.test(lower)) return 'ts';
     if (/\.(mp4|mkv|mov|webm|m4v|avi)(\?|#|$)/.test(lower)) return 'native';
+
+    // 原生组播协议（浏览器/渲染进程无法直接播放）→ 归为 unknown 交由上层提示
+    if (/^(rtp|udp|rtsp):\/\//i.test(lower)) return 'unknown';
+
     try {
       const res = await fetch(url, { method: 'HEAD', mode: 'cors' });
       const ct = (res.headers.get('content-type') || '').toLowerCase();
@@ -45,7 +66,7 @@ class StreamDetector {
         const text = await res.text();
         if (text.trim().startsWith('#EXTM3U')) return 'hls';
         if (text.includes('FLV')) return 'flv';
-        return 'hls';
+        return 'ts';
       } catch {
         return 'unknown';
       }
@@ -71,7 +92,8 @@ function LiveVideoPlayer({
 
   useEffect(() => {
     const v = videoRef.current;
-    if (!v || !url) return;
+    const src = sanitizeUrl(url);
+    if (!v || !src) return;
 
     let destroyed = false;
     const destroyHls = () => { if (hlsRef.current) { try { hlsRef.current.destroy(); } catch {} hlsRef.current = null; } };
@@ -83,7 +105,7 @@ function LiveVideoPlayer({
     };
 
     const playNative = () => {
-      v.src = url;
+      v.src = src;
       v.load();
       safePlay();
     };
@@ -129,17 +151,35 @@ function LiveVideoPlayer({
     };
 
     const playMpegts = async (type: 'flv' | 'mpegts', sourceUrl: string) => {
+      let mpegts: any = null;
       try {
         // @ts-ignore 动态加载可选依赖
         const mod = await import(/* @vite-ignore */ 'mpegts.js').catch(() => null);
-        const mpegts: any = (mod as any)?.default || (mod as any);
-        if (!mpegts || typeof mpegts.isSupported !== 'function' || !mpegts.isSupported()) {
-          playNative();
-          return;
-        }
+        mpegts = (mod as any)?.default || (mod as any);
+      } catch {
+        mpegts = null;
+      }
+      if (destroyed) return;
+
+      // ★ 2026-10-21：mpegts.js 缺失时明确报错，不再退回 native（native 无法解析 TS/FLV 裸流）
+      if (!mpegts || typeof mpegts.isSupported !== 'function' || !mpegts.isSupported()) {
+        cbRef.current.onVideoError(
+          '当前环境不支持 TS/FLV 播放：缺少 mpegts.js 依赖或 MSE 不可用，请执行 npm i mpegts.js',
+        );
+        return;
+      }
+
+      try {
         const player = mpegts.createPlayer(
           { type, url: sourceUrl, isLive: true },
-          { enableWorker: true, enableStashBuffer: false, stashInitialSize: 128, lazyLoad: false },
+          {
+            enableWorker: true,
+            enableStashBuffer: false,
+            stashInitialSize: 128,
+            lazyLoad: false,
+            autoCleanupSourceBuffer: true,
+            reuseRedirectedURL: true,
+          },
         );
         mpegtsRef.current = player;
         player.attachMediaElement(v);
@@ -149,19 +189,29 @@ function LiveVideoPlayer({
           cbRef.current.onVideoError(`流错误：${errType}/${errDetail}`);
           cbRef.current.onReconnect();
         });
-      } catch {
-        playNative();
+      } catch (e) {
+        cbRef.current.onVideoError(`创建 TS/FLV 播放器失败：${(e as Error).message}`);
       }
     };
 
     (async () => {
-      const kind = await StreamDetector.detect(url);
+      const kind = await StreamDetector.detect(src);
       if (destroyed) return;
-      if (kind === 'hls') playHls(url);
-      else if (kind === 'flv') void playMpegts('flv', url);
-      else if (kind === 'ts') void playMpegts('mpegts', url);
+      if (kind === 'hls') playHls(src);
+      else if (kind === 'flv') void playMpegts('flv', src);
+      else if (kind === 'ts') void playMpegts('mpegts', src);
       else if (kind === 'native') playNative();
-      else playHls(url);
+      else {
+        // ★ 2026-10-21：原生组播/未知地址给出明确提示，不再盲目尝试 HLS
+        if (/^(rtp|udp|rtsp):\/\//i.test(src)) {
+          cbRef.current.onVideoError(
+            `暂不支持原生 ${src.split(':')[0]}:// 协议，请改用 HTTP 代理地址（如 udpxy / rtp2httpd 的 /udp/ 形式）`,
+          );
+          return;
+        }
+        cbRef.current.onVideoError(`无法识别的流地址，尝试按 HLS 播放：${src}`);
+        playHls(src);
+      }
     })();
 
     const onEnded = () => cbRef.current.onReconnect();
