@@ -1,4 +1,3 @@
-
 import { useEffect, useRef, useState, useCallback } from 'react';
 import Hls from 'hls.js';
 import { client } from '../api/client';
@@ -23,33 +22,46 @@ function saveLiveMem(m: LiveMem): void {
 }
 
 type EpgStatus = 'idle' | 'loading' | 'ok' | 'empty' | 'error';
+type StreamKind = 'hls' | 'flv' | 'ts' | 'native' | 'unsupported' | 'unknown';
 
+/**
+ * ★ 2026-10-21：URL 规整
+ *   IPTV 的 m3u 常把"线路标签"直接拼在 URL 尾部（如 `http://.../udp/224.1.4.215:11111$组播`），
+ *   直接请求会 404。这里剥离 `$` 之后的全部内容。
+ */
+function sanitizeUrl(raw: string): string {
+  const s = String(raw || '').trim();
+  const i = s.indexOf('$');
+  return (i >= 0 ? s.slice(0, i) : s).trim();
+}
+
+/**
+ * ★ 2026-10-21：完全同步的流类型识别
+ *   原实现用 fetch(HEAD/GET) 探测，对 udpxy/rtp2httpd 这类"无限 TS 流"地址会：
+ *     1) HEAD 未必被支持；
+ *     2) GET 一旦成功，`await res.text()` 会永远阻塞（TS 流没有 EOF）→ 播放器彻底卡死。
+ *   所以改成纯同步，并按 IPTV 场景的常见模式直接判定。
+ */
 class StreamDetector {
-  static async detect(url: string): Promise<'hls' | 'flv' | 'ts' | 'native' | 'unknown'> {
-    const lower = url.toLowerCase();
+  static detect(rawUrl: string): StreamKind {
+    const url = sanitizeUrl(rawUrl);
+    if (!url) return 'unknown';
+    let decoded = url;
+    try { decoded = decodeURIComponent(url); } catch { /* ignore */ }
+    const lower = decoded.toLowerCase();
+
+    // 原生组播协议（渲染进程无原生支持）
+    if (/^(rtp|udp|rtsp|igmp|multicast):\/\//i.test(lower)) return 'unsupported';
+
+    // HTTP 代理的组播（udpxy / rtp2httpd / msd_lite），形如 http://ip:port/udp/224.x.x.x:1234
+    if (/\/(udp|rtp|rtsp|igmp|multicast)\//.test(lower)) return 'ts';
+
     if (lower.includes('.m3u8')) return 'hls';
     if (lower.includes('.flv')) return 'flv';
     if (/\.ts(\?|#|$)/.test(lower)) return 'ts';
     if (/\.(mp4|mkv|mov|webm|m4v|avi)(\?|#|$)/.test(lower)) return 'native';
-    try {
-      const res = await fetch(url, { method: 'HEAD', mode: 'cors' });
-      const ct = (res.headers.get('content-type') || '').toLowerCase();
-      if (ct.includes('mpegurl') || ct.includes('m3u8')) return 'hls';
-      if (ct.includes('flv')) return 'flv';
-      if (ct.includes('mp2t') || ct.includes('mpegts')) return 'ts';
-      if (ct.includes('video/') || ct.includes('audio/')) return 'native';
-    } catch {
-      try {
-        const res = await fetch(url, { method: 'GET', mode: 'cors' });
-        const text = await res.text();
-        if (text.trim().startsWith('#EXTM3U')) return 'hls';
-        if (text.includes('FLV')) return 'flv';
-        return 'hls';
-      } catch {
-        return 'unknown';
-      }
-    }
-    return 'hls';
+
+    return 'unknown';
   }
 }
 
@@ -70,7 +82,8 @@ function LiveVideoPlayer({
 
   useEffect(() => {
     const v = videoRef.current;
-    if (!v || !url) return;
+    const src = sanitizeUrl(url);
+    if (!v || !src) return;
 
     let destroyed = false;
     const destroyHls = () => { if (hlsRef.current) { try { hlsRef.current.destroy(); } catch {} hlsRef.current = null; } };
@@ -82,7 +95,7 @@ function LiveVideoPlayer({
     };
 
     const playNative = () => {
-      v.src = url;
+      v.src = src;
       v.load();
       safePlay();
     };
@@ -127,40 +140,101 @@ function LiveVideoPlayer({
       });
     };
 
+    /**
+     * ★ 2026-10-21：mpegts.js 拉流
+     *   - 依赖缺失时明确报错，不再 fallback 到 native（native 无法解 TS 裸流）
+     *   - 关闭 enableWorker：Electron 打包后 worker 加载路径经常失败，关闭最稳
+     *   - 把 mpegts.js 的原始 errType/errDetail 吐到 UI，方便定位 CORS / 编码
+     */
     const playMpegts = async (type: 'flv' | 'mpegts', sourceUrl: string) => {
+      let mpegts: any = null;
       try {
-        // @ts-ignore 动态加载可选依赖
-        const mod = await import(/* @vite-ignore */ 'mpegts.js').catch(() => null);
-        const mpegts: any = (mod as any)?.default || (mod as any);
-        if (!mpegts || typeof mpegts.isSupported !== 'function' || !mpegts.isSupported()) {
-          playNative();
-          return;
-        }
+        // @ts-ignore 可选依赖，动态加载
+        const mod = await import(/* @vite-ignore */ 'mpegts.js');
+        mpegts = (mod as any)?.default || (mod as any);
+      } catch (e) {
+        cbRef.current.onVideoError(
+          `未找到 mpegts.js（${(e as Error).message}）。请执行：npm i mpegts.js`,
+        );
+        return;
+      }
+      if (destroyed) return;
+      if (!mpegts || typeof mpegts.isSupported !== 'function' || !mpegts.isSupported()) {
+        cbRef.current.onVideoError('当前环境不支持 MSE（mpegts.js isSupported() === false）');
+        return;
+      }
+
+      // 打印环境能力，方便排查
+      try {
+        const feats = typeof mpegts.getFeatureList === 'function' ? mpegts.getFeatureList() : null;
+        // eslint-disable-next-line no-console
+        console.log('[LivePlayer] mpegts.js features =', feats);
+      } catch { /* ignore */ }
+
+      try {
         const player = mpegts.createPlayer(
-          { type, url: sourceUrl, isLive: true },
-          { enableWorker: true, enableStashBuffer: false, stashInitialSize: 128, lazyLoad: false },
+          {
+            type,
+            url: sourceUrl,
+            isLive: true,
+            cors: true,
+            withCredentials: false,
+          },
+          {
+            enableWorker: false,        // Electron 打包场景下 worker 路径常失败
+            enableStashBuffer: false,
+            stashInitialSize: 128,
+            lazyLoad: false,
+            autoCleanupSourceBuffer: true,
+            reuseRedirectedURL: true,
+          },
         );
         mpegtsRef.current = player;
         player.attachMediaElement(v);
         player.load();
-        try { player.play(); } catch {}
-        player.on(mpegts.Events?.ERROR || 'error', (errType: unknown, errDetail: unknown) => {
-          cbRef.current.onVideoError(`流错误：${errType}/${errDetail}`);
-          cbRef.current.onReconnect();
+        try { player.play(); } catch { /* autoPlay 兜底 */ }
+
+        player.on('error', (errType: unknown, errDetail: unknown, errInfo?: any) => {
+          if (destroyed) return;
+          const typeStr = String(errType || '');
+          const infoStr = String(errDetail || '');
+          const more = errInfo ? ` ${JSON.stringify(errInfo)}` : '';
+          const combined = `${typeStr} ${infoStr} ${more}`.toLowerCase();
+          let hint = '';
+          if (combined.includes('cross-origin') || combined.includes('cors')) {
+            hint = '（CORS 跨域被拦截：服务端需返回 Access-Control-Allow-Origin，或主进程需放行）';
+          } else if (combined.includes('network') || combined.includes('fetch')) {
+            hint = '（网络错误：确认服务器可访问、未被 CORS 或证书拦截）';
+          } else if (combined.includes('codec') || combined.includes('decode') || combined.includes('unsupported')) {
+            hint = '（编码不支持：该流可能是 HEVC/H.265 等 Chromium 无法直接解码的格式）';
+          }
+          cbRef.current.onVideoError(`TS 拉流失败 [${typeStr}] ${infoStr}${more}${hint}`);
         });
-      } catch {
-        playNative();
+
+        player.on('mediaInfo', () => {
+          if (destroyed) return;
+          cbRef.current.onVideoError(''); // 成功拉到媒体
+        });
+      } catch (e) {
+        cbRef.current.onVideoError(`创建 mpegts 播放器失败：${(e as Error).message}`);
       }
     };
 
-    (async () => {
-      const kind = await StreamDetector.detect(url);
+    // ★ 同步识别，不再 await，避免 async 探测死锁
+    (() => {
+      const kind = StreamDetector.detect(src);
       if (destroyed) return;
-      if (kind === 'hls') playHls(url);
-      else if (kind === 'flv') void playMpegts('flv', url);
-      else if (kind === 'ts') void playMpegts('mpegts', url);
-      else if (kind === 'native') playNative();
-      else playHls(url);
+      if (kind === 'unsupported') {
+        cbRef.current.onVideoError(
+          `不支持的地址协议 ${src.split(':')[0]}://。请改用 HTTP 代理形式（如 rtp2httpd/udpxy 的 http://host:port/udp/组播IP:端口）`,
+        );
+        return;
+      }
+      if (kind === 'hls') { playHls(src); return; }
+      if (kind === 'flv') { void playMpegts('flv', src); return; }
+      if (kind === 'native') { playNative(); return; }
+      // 'ts' 或 'unknown'：IPTV 场景下大多数裸 http 流都是 MPEG-TS
+      void playMpegts('mpegts', src);
     })();
 
     const onEnded = () => cbRef.current.onReconnect();
