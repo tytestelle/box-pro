@@ -24,18 +24,12 @@ function saveLiveMem(m: LiveMem): void {
 type EpgStatus = 'idle' | 'loading' | 'ok' | 'empty' | 'error';
 type StreamKind = 'hls' | 'flv' | 'ts' | 'native' | 'unsupported' | 'unknown';
 
-/**
- * ★ URL 规整：剥离 IPTV m3u 中 URL 尾部可能存在的 $线路标签
- */
 function sanitizeUrl(raw: string): string {
   const s = String(raw || '').trim();
   const i = s.indexOf('$');
   return (i >= 0 ? s.slice(0, i) : s).trim();
 }
 
-/**
- * ★ 完全同步的流类型识别，避免 fetch 探测引发的无限流阻塞
- */
 class StreamDetector {
   static detect(rawUrl: string): StreamKind {
     const url = sanitizeUrl(rawUrl);
@@ -68,7 +62,6 @@ function LiveVideoPlayer({
   const hlsRef = useRef<any>(null);
   const mpegtsRef = useRef<any>(null);
   
-  // 记录当前流重连的次数，防止死循环
   const retryCountRef = useRef(0);
 
   const cbRef = useRef({ onReconnect, onVideoError });
@@ -145,7 +138,6 @@ function LiveVideoPlayer({
       }
 
       try {
-        // ★ 回归最保守的默认配置，确保兼容性优先
         const player = mpegts.createPlayer(
           {
             type,
@@ -173,48 +165,42 @@ function LiveVideoPlayer({
           const infoStr = String(errDetail || '');
           const combined = `${typeStr} ${infoStr} ${JSON.stringify(errInfo || {})}`.toLowerCase();
 
+          // 强制销毁播放器，并清空 video 元素，释放底层网络句柄
           try { player.destroy(); } catch {}
           if (mpegtsRef.current === player) mpegtsRef.current = null;
+          try { v.removeAttribute('src'); v.load(); } catch {}
 
-          // 1. 处理服务器连接数超限 (udpxy/rtp2httpd 503)
+          // 1. 处理 503 (服务端连接池占满)
           if (combined.includes('503') || combined.includes('client limit')) {
-            retryCountRef.current++;
-            if (retryCountRef.current > 3) {
-              cbRef.current.onVideoError('服务端并发连接超限，请稍后再试或重启路由器');
-              return;
-            }
-            cbRef.current.onVideoError(`连接数超限，冷却 15 秒后重试 (${retryCountRef.current}/3)...`);
-            setTimeout(() => {
-              if (!destroyed) void playMpegts(type, sourceUrl);
-            }, 15000);
-            return;
+            cbRef.current.onVideoError('服务器连接数已满 (503)，请稍后点击重试，或切换其他线路');
+            return; // ★ 遇到 503 绝不自动重试，防止把服务器彻底打死
           }
 
           // 2. 处理解码器崩溃 (MediaMSEError)
           if (combined.includes('mediaerror') || combined.includes('media_error') || combined.includes('appendbuffer')) {
             retryCountRef.current++;
-            if (retryCountRef.current > 5) {
+            if (retryCountRef.current > 2) {
               cbRef.current.onVideoError('该频道解码频繁崩溃，请尝试切换线路');
               return;
             }
-            cbRef.current.onVideoError(`解码器崩溃，3 秒后自动恢复 (${retryCountRef.current}/5)...`);
+            cbRef.current.onVideoError(`解码崩溃，5 秒后自动重试 (${retryCountRef.current}/2)...`);
             setTimeout(() => {
               if (!destroyed) void playMpegts(type, sourceUrl);
-            }, 3000);
+            }, 5000);
             return;
           }
 
-          // 3. 其他致命错误
+          // 3. 其他网络或协议错误
           let hint = '';
           if (combined.includes('cross-origin') || combined.includes('cors')) {
-            hint = '（CORS 跨域被拦截，需在主进程放行）';
+            hint = '（CORS 跨域被拦截）';
           }
           cbRef.current.onVideoError(`播放失败 [${typeStr}] ${infoStr} ${hint}`);
         });
 
         player.on('mediaInfo', () => {
           if (destroyed) return;
-          retryCountRef.current = 0; // 成功播放则重置重试计数
+          retryCountRef.current = 0; 
           cbRef.current.onVideoError(''); 
         });
       } catch (e) {
@@ -231,7 +217,6 @@ function LiveVideoPlayer({
       }
       if (kind === 'hls') { playHls(src); return; }
       if (kind === 'native') { playNative(); return; }
-      // flv / ts / unknown 统一交给 mpegts.js 处理
       void playMpegts(kind === 'flv' ? 'flv' : 'mpegts', src);
     })();
 
