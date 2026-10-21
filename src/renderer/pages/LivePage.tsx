@@ -141,10 +141,10 @@ function LiveVideoPlayer({
     };
 
     /**
-     * ★ 2026-10-21：mpegts.js 拉流
-     *   - 依赖缺失时明确报错，不再 fallback 到 native（native 无法解 TS 裸流）
-     *   - 关闭 enableWorker：Electron 打包后 worker 加载路径经常失败，关闭最稳
-     *   - 把 mpegts.js 的原始 errType/errDetail 吐到 UI，方便定位 CORS / 编码
+     * ★ 2026-10-21：mpegts.js 拉流与防崩溃机制
+     *   - 依赖缺失时明确报错，不再 fallback 到 native
+     *   - 配置开启缓冲区、时间戳修复、追帧，防止长时间播放因丢包导致硬解崩溃
+     *   - 捕获 MediaMSEError 后自动重建拉流管线
      */
     const playMpegts = async (type: 'flv' | 'mpegts', sourceUrl: string) => {
       let mpegts: any = null;
@@ -164,13 +164,6 @@ function LiveVideoPlayer({
         return;
       }
 
-      // 打印环境能力，方便排查
-      try {
-        const feats = typeof mpegts.getFeatureList === 'function' ? mpegts.getFeatureList() : null;
-        // eslint-disable-next-line no-console
-        console.log('[LivePlayer] mpegts.js features =', feats);
-      } catch { /* ignore */ }
-
       try {
         const player = mpegts.createPlayer(
           {
@@ -181,12 +174,17 @@ function LiveVideoPlayer({
             withCredentials: false,
           },
           {
-            enableWorker: false,        // Electron 打包场景下 worker 路径常失败
-            enableStashBuffer: false,
-            stashInitialSize: 128,
+            enableWorker: false,        // Electron 打包场景下 worker 路径常失败，关闭更稳
+            enableStashBuffer: true,    // ★ 开启缓冲池，平抑网络抖动
+            stashInitialSize: 1024,     // ★ 增大初始缓冲
             lazyLoad: false,
-            autoCleanupSourceBuffer: true,
-            reuseRedirectedURL: true,
+            autoCleanupSourceBuffer: true,      // 自动清理内存
+            autoCleanupMaxBackwardDuration: 60, // ★ 保留更多缓冲，防止硬解丢失参考帧崩溃
+            autoCleanupMinBackwardDuration: 30,
+            fixAudioTimestampGap: true,         // ★ 自动修复音视频时间戳断层
+            liveBufferLatencyChasing: true,     // ★ 开启追帧
+            liveBufferLatencyMaxLatency: 3.0,
+            liveBufferLatencyMinRemain: 0.5,
           },
         );
         mpegtsRef.current = player;
@@ -196,10 +194,26 @@ function LiveVideoPlayer({
 
         player.on('error', (errType: unknown, errDetail: unknown, errInfo?: any) => {
           if (destroyed) return;
+          
           const typeStr = String(errType || '');
           const infoStr = String(errDetail || '');
+          const combined = `${typeStr} ${infoStr}`.toLowerCase();
+
+          // ★ 核心修复：针对 MediaMSEError（解码器崩溃/appendBuffer失败）执行自动重建
+          if (combined.includes('mediaerror') || combined.includes('media_error') || combined.includes('appendbuffer')) {
+            console.warn('[LivePlayer] 触发 MediaMSEError，正在重建解码器...');
+            try { player.destroy(); } catch {}
+            if (mpegtsRef.current === player) mpegtsRef.current = null;
+            
+            // 延迟 500ms 后重新拉流，避免瞬时高频重试导致死循环
+            setTimeout(() => {
+              if (!destroyed) void playMpegts(type, sourceUrl);
+            }, 500);
+            return;
+          }
+
+          // 其他类型的错误（如 CORS 拦截、网络断开等）
           const more = errInfo ? ` ${JSON.stringify(errInfo)}` : '';
-          const combined = `${typeStr} ${infoStr} ${more}`.toLowerCase();
           let hint = '';
           if (combined.includes('cross-origin') || combined.includes('cors')) {
             hint = '（CORS 跨域被拦截：服务端需返回 Access-Control-Allow-Origin，或主进程需放行）';
@@ -209,11 +223,12 @@ function LiveVideoPlayer({
             hint = '（编码不支持：该流可能是 HEVC/H.265 等 Chromium 无法直接解码的格式）';
           }
           cbRef.current.onVideoError(`TS 拉流失败 [${typeStr}] ${infoStr}${more}${hint}`);
+          cbRef.current.onReconnect();
         });
 
         player.on('mediaInfo', () => {
           if (destroyed) return;
-          cbRef.current.onVideoError(''); // 成功拉到媒体
+          cbRef.current.onVideoError(''); // 成功拉到媒体，清除 UI 上的报错提示
         });
       } catch (e) {
         cbRef.current.onVideoError(`创建 mpegts 播放器失败：${(e as Error).message}`);
@@ -517,15 +532,10 @@ export default function LivePage() {
 
   /**
    * ★ 2026-10-14（用户要求）：打开 EPG 独立窗口。
-   *   - 传 `groups`（整个直播源的**所有分组**）+ `currentGroup`（当前分组名）
-   *     → EPG 窗口左侧渲染「分组 → 频道」列表，点分组展开、点频道加载其节目预告。
-   *   - 传 `channelName / tvgId / tvgName` 作为「初始频道」= 主窗口**当前正在播放的频道**
-   *     → EPG 窗口顶部「↩ 当前」按钮可一键切回。
    */
   async function openPrograms(channel: { name: string; 'tvg-id'?: string; 'tvg-name'?: string }) {
     const name = (channel.name || '').trim();
     if (!name) return;
-    // ★ 传整个直播源的所有分组（不只是当前分组）
     const groupList = groups
       .map((g) => ({
         group: String(g.group || '').trim(),
