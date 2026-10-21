@@ -25,9 +25,7 @@ type EpgStatus = 'idle' | 'loading' | 'ok' | 'empty' | 'error';
 type StreamKind = 'hls' | 'flv' | 'ts' | 'native' | 'unsupported' | 'unknown';
 
 /**
- * ★ 2026-10-21：URL 规整
- *   IPTV 的 m3u 常把"线路标签"直接拼在 URL 尾部（如 `http://.../udp/224.1.4.215:11111$组播`），
- *   直接请求会 404。这里剥离 `$` 之后的全部内容。
+ * ★ URL 规整：剥离 IPTV m3u 中 URL 尾部可能存在的 $线路标签
  */
 function sanitizeUrl(raw: string): string {
   const s = String(raw || '').trim();
@@ -36,11 +34,7 @@ function sanitizeUrl(raw: string): string {
 }
 
 /**
- * ★ 2026-10-21：完全同步的流类型识别
- *   原实现用 fetch(HEAD/GET) 探测，对 udpxy/rtp2httpd 这类"无限 TS 流"地址会：
- *     1) HEAD 未必被支持；
- *     2) GET 一旦成功，`await res.text()` 会永远阻塞（TS 流没有 EOF）→ 播放器彻底卡死。
- *   所以改成纯同步，并按 IPTV 场景的常见模式直接判定。
+ * ★ 完全同步的流类型识别，避免 fetch 探测引发的无限流阻塞
  */
 class StreamDetector {
   static detect(rawUrl: string): StreamKind {
@@ -50,12 +44,8 @@ class StreamDetector {
     try { decoded = decodeURIComponent(url); } catch { /* ignore */ }
     const lower = decoded.toLowerCase();
 
-    // 原生组播协议（渲染进程无原生支持）
     if (/^(rtp|udp|rtsp|igmp|multicast):\/\//i.test(lower)) return 'unsupported';
-
-    // HTTP 代理的组播（udpxy / rtp2httpd / msd_lite），形如 http://ip:port/udp/224.x.x.x:1234
     if (/\/(udp|rtp|rtsp|igmp|multicast)\//.test(lower)) return 'ts';
-
     if (lower.includes('.m3u8')) return 'hls';
     if (lower.includes('.flv')) return 'flv';
     if (/\.ts(\?|#|$)/.test(lower)) return 'ts';
@@ -77,6 +67,10 @@ function LiveVideoPlayer({
   const videoRef = useRef<HTMLVideoElement>(null);
   const hlsRef = useRef<any>(null);
   const mpegtsRef = useRef<any>(null);
+  
+  // 记录当前流重连的次数，防止死循环
+  const retryCountRef = useRef(0);
+
   const cbRef = useRef({ onReconnect, onVideoError });
   cbRef.current = { onReconnect, onVideoError };
 
@@ -85,7 +79,9 @@ function LiveVideoPlayer({
     const src = sanitizeUrl(url);
     if (!v || !src) return;
 
+    retryCountRef.current = 0;
     let destroyed = false;
+
     const destroyHls = () => { if (hlsRef.current) { try { hlsRef.current.destroy(); } catch {} hlsRef.current = null; } };
     const destroyMpegts = () => { if (mpegtsRef.current) { try { mpegtsRef.current.destroy(); } catch {} mpegtsRef.current = null; } };
 
@@ -106,26 +102,18 @@ function LiveVideoPlayer({
         enableWorker: true,
         lowLatencyMode: false,
         backBufferLength: 30,
-        maxBufferLength: 20,
         manifestLoadingTimeOut: 15000,
         manifestLoadingMaxRetry: 6,
-        manifestLoadingRetryDelay: 500,
-        levelLoadingTimeOut: 15000,
-        fragLoadingTimeOut: 30000,
         xhrSetup: (xhr: XMLHttpRequest) => { xhr.withCredentials = false; },
       });
       hlsRef.current = hls;
       hls.loadSource(sourceUrl);
       hls.attachMedia(v);
 
-      hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        if (destroyed) return;
-        safePlay();
-      });
+      hls.on(Hls.Events.MANIFEST_PARSED, () => { if (!destroyed) safePlay(); });
 
       hls.on(Hls.Events.ERROR, (_evt: unknown, data: any) => {
-        if (destroyed) return;
-        if (!data?.fatal) return;
+        if (destroyed || !data?.fatal) return;
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
           cbRef.current.onVideoError('HLS 网络错误，尝试恢复…');
           try { hls.startLoad(); } catch {}
@@ -140,31 +128,24 @@ function LiveVideoPlayer({
       });
     };
 
-    /**
-     * ★ 2026-10-21：mpegts.js 拉流与防崩溃机制
-     *   - 依赖缺失时明确报错，不再 fallback 到 native
-     *   - 配置开启缓冲区、时间戳修复、追帧，防止长时间播放因丢包导致硬解崩溃
-     *   - 捕获 MediaMSEError 后自动重建拉流管线
-     */
     const playMpegts = async (type: 'flv' | 'mpegts', sourceUrl: string) => {
       let mpegts: any = null;
       try {
-        // @ts-ignore 可选依赖，动态加载
+        // @ts-ignore
         const mod = await import(/* @vite-ignore */ 'mpegts.js');
         mpegts = (mod as any)?.default || (mod as any);
       } catch (e) {
-        cbRef.current.onVideoError(
-          `未找到 mpegts.js（${(e as Error).message}）。请执行：npm i mpegts.js`,
-        );
+        cbRef.current.onVideoError(`未找到 mpegts.js。请执行：npm i mpegts.js`);
         return;
       }
       if (destroyed) return;
       if (!mpegts || typeof mpegts.isSupported !== 'function' || !mpegts.isSupported()) {
-        cbRef.current.onVideoError('当前环境不支持 MSE（mpegts.js isSupported() === false）');
+        cbRef.current.onVideoError('当前环境不支持 MSE');
         return;
       }
 
       try {
+        // ★ 回归最保守的默认配置，确保兼容性优先
         const player = mpegts.createPlayer(
           {
             type,
@@ -174,85 +155,86 @@ function LiveVideoPlayer({
             withCredentials: false,
           },
           {
-            enableWorker: false,        // Electron 打包场景下 worker 路径常失败，关闭更稳
-            enableStashBuffer: true,    // ★ 开启缓冲池，平抑网络抖动
-            stashInitialSize: 1024,     // ★ 增大初始缓冲
+            enableWorker: false,
+            enableStashBuffer: false,
             lazyLoad: false,
-            autoCleanupSourceBuffer: true,      // 自动清理内存
-            autoCleanupMaxBackwardDuration: 60, // ★ 保留更多缓冲，防止硬解丢失参考帧崩溃
-            autoCleanupMinBackwardDuration: 30,
-            fixAudioTimestampGap: true,         // ★ 自动修复音视频时间戳断层
-            liveBufferLatencyChasing: true,     // ★ 开启追帧
-            liveBufferLatencyMaxLatency: 3.0,
-            liveBufferLatencyMinRemain: 0.5,
+            autoCleanupSourceBuffer: true,
           },
         );
         mpegtsRef.current = player;
         player.attachMediaElement(v);
         player.load();
-        try { player.play(); } catch { /* autoPlay 兜底 */ }
+        try { player.play(); } catch {}
 
         player.on('error', (errType: unknown, errDetail: unknown, errInfo?: any) => {
           if (destroyed) return;
           
           const typeStr = String(errType || '');
           const infoStr = String(errDetail || '');
-          const combined = `${typeStr} ${infoStr}`.toLowerCase();
+          const combined = `${typeStr} ${infoStr} ${JSON.stringify(errInfo || {})}`.toLowerCase();
 
-          // ★ 核心修复：针对 MediaMSEError（解码器崩溃/appendBuffer失败）执行自动重建
-          if (combined.includes('mediaerror') || combined.includes('media_error') || combined.includes('appendbuffer')) {
-            console.warn('[LivePlayer] 触发 MediaMSEError，正在重建解码器...');
-            try { player.destroy(); } catch {}
-            if (mpegtsRef.current === player) mpegtsRef.current = null;
-            
-            // 延迟 500ms 后重新拉流，避免瞬时高频重试导致死循环
+          try { player.destroy(); } catch {}
+          if (mpegtsRef.current === player) mpegtsRef.current = null;
+
+          // 1. 处理服务器连接数超限 (udpxy/rtp2httpd 503)
+          if (combined.includes('503') || combined.includes('client limit')) {
+            retryCountRef.current++;
+            if (retryCountRef.current > 3) {
+              cbRef.current.onVideoError('服务端并发连接超限，请稍后再试或重启路由器');
+              return;
+            }
+            cbRef.current.onVideoError(`连接数超限，冷却 15 秒后重试 (${retryCountRef.current}/3)...`);
             setTimeout(() => {
               if (!destroyed) void playMpegts(type, sourceUrl);
-            }, 500);
+            }, 15000);
             return;
           }
 
-          // 其他类型的错误（如 CORS 拦截、网络断开等）
-          const more = errInfo ? ` ${JSON.stringify(errInfo)}` : '';
+          // 2. 处理解码器崩溃 (MediaMSEError)
+          if (combined.includes('mediaerror') || combined.includes('media_error') || combined.includes('appendbuffer')) {
+            retryCountRef.current++;
+            if (retryCountRef.current > 5) {
+              cbRef.current.onVideoError('该频道解码频繁崩溃，请尝试切换线路');
+              return;
+            }
+            cbRef.current.onVideoError(`解码器崩溃，3 秒后自动恢复 (${retryCountRef.current}/5)...`);
+            setTimeout(() => {
+              if (!destroyed) void playMpegts(type, sourceUrl);
+            }, 3000);
+            return;
+          }
+
+          // 3. 其他致命错误
           let hint = '';
           if (combined.includes('cross-origin') || combined.includes('cors')) {
-            hint = '（CORS 跨域被拦截：服务端需返回 Access-Control-Allow-Origin，或主进程需放行）';
-          } else if (combined.includes('network') || combined.includes('fetch')) {
-            hint = '（网络错误：确认服务器可访问、未被 CORS 或证书拦截）';
-          } else if (combined.includes('codec') || combined.includes('decode') || combined.includes('unsupported')) {
-            hint = '（编码不支持：该流可能是 HEVC/H.265 等 Chromium 无法直接解码的格式）';
+            hint = '（CORS 跨域被拦截，需在主进程放行）';
           }
-          cbRef.current.onVideoError(`TS 拉流失败 [${typeStr}] ${infoStr}${more}${hint}`);
-          cbRef.current.onReconnect();
+          cbRef.current.onVideoError(`播放失败 [${typeStr}] ${infoStr} ${hint}`);
         });
 
         player.on('mediaInfo', () => {
           if (destroyed) return;
-          cbRef.current.onVideoError(''); // 成功拉到媒体，清除 UI 上的报错提示
+          retryCountRef.current = 0; // 成功播放则重置重试计数
+          cbRef.current.onVideoError(''); 
         });
       } catch (e) {
-        cbRef.current.onVideoError(`创建 mpegts 播放器失败：${(e as Error).message}`);
+        cbRef.current.onVideoError(`创建播放器失败：${(e as Error).message}`);
       }
     };
 
-    // ★ 同步识别，不再 await，避免 async 探测死锁
     (() => {
       const kind = StreamDetector.detect(src);
       if (destroyed) return;
       if (kind === 'unsupported') {
-        cbRef.current.onVideoError(
-          `不支持的地址协议 ${src.split(':')[0]}://。请改用 HTTP 代理形式（如 rtp2httpd/udpxy 的 http://host:port/udp/组播IP:端口）`,
-        );
+        cbRef.current.onVideoError(`不支持原生 ${src.split(':')[0]}:// 协议，请改用 HTTP 代理地址`);
         return;
       }
       if (kind === 'hls') { playHls(src); return; }
-      if (kind === 'flv') { void playMpegts('flv', src); return; }
       if (kind === 'native') { playNative(); return; }
-      // 'ts' 或 'unknown'：IPTV 场景下大多数裸 http 流都是 MPEG-TS
-      void playMpegts('mpegts', src);
+      // flv / ts / unknown 统一交给 mpegts.js 处理
+      void playMpegts(kind === 'flv' ? 'flv' : 'mpegts', src);
     })();
 
-    const onEnded = () => cbRef.current.onReconnect();
     const onErr = () => {
       const err = v.error;
       const code = err?.code;
@@ -261,17 +243,13 @@ function LiveVideoPlayer({
       if (code === 2 || code === 4) cbRef.current.onReconnect();
     };
     const onPlaying = () => cbRef.current.onVideoError('');
-    v.addEventListener('ended', onEnded);
     v.addEventListener('error', onErr);
     v.addEventListener('playing', onPlaying);
-    v.addEventListener('play', onPlaying);
 
     return () => {
       destroyed = true;
-      v.removeEventListener('ended', onEnded);
       v.removeEventListener('error', onErr);
       v.removeEventListener('playing', onPlaying);
-      v.removeEventListener('play', onPlaying);
       destroyHls();
       destroyMpegts();
       try { v.removeAttribute('src'); v.load(); } catch {}
@@ -453,7 +431,6 @@ export default function LivePage() {
     return () => { if (typeof off === 'function') off(); };
   }, [loadSubStatus, reloadLives]);
 
-  // ★ 2026-10-14（用户要求）：监听主进程广播的「直播源已变更」→ 自动重新加载
   useEffect(() => {
     const w = window as any;
     const off = w?.winboxIpc?.on?.('live:changed', (payload: { index?: number; name?: string; replaced?: boolean }) => {
@@ -530,9 +507,6 @@ export default function LivePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [epg, groupName, channelName, liveIdx]);
 
-  /**
-   * ★ 2026-10-14（用户要求）：打开 EPG 独立窗口。
-   */
   async function openPrograms(channel: { name: string; 'tvg-id'?: string; 'tvg-name'?: string }) {
     const name = (channel.name || '').trim();
     if (!name) return;
@@ -689,7 +663,6 @@ export default function LivePage() {
           )}
         </div>
       </div>
-      {/* ★ 2026-10-14：节目单弹窗已改为独立窗口（见 main/player/EpgWindow.ts + pages/EpgWinPage.tsx）*/}
     </>
   );
 }
