@@ -78,6 +78,8 @@ declare global {
         importJsonLocal: (name?: string) =>
           Promise<IpcResult<{ ok: boolean; file?: string; name?: string; error?: string; result?: ImportReturn }>>;
         importPyLocal: () => Promise<IpcResult<{ ok: boolean; key?: string; error?: string }>>;
+        // ★ 2026-11-10（用户要求）：网络 .py 文件导入（下载 → 校验 → 写入 imports/py/net-<sha1>/ → 加入源）
+        importPyUrl: (url: string) => Promise<IpcResult<{ ok: boolean; key?: string; error?: string }>>;
         /** ★ 2026-09-30（用户要求）：导入本地 TXT / M3U 直播源 */
         importLiveLocal: () =>
           Promise<IpcResult<{ ok: boolean; name?: string; index?: number; replaced?: boolean; total?: number; error?: string }>>;
@@ -300,6 +302,8 @@ export const client = {
   cfgImportUrl: (url: string, name?: string) => unwrap(window.api.config.importUrl(url, name)),
   cfgImportJsonLocal: (name?: string) => unwrap(window.api.config.importJsonLocal(name)),
   cfgImportPyLocal: () => unwrap(window.api.config.importPyLocal()),
+  /** ★ 2026-11-10（用户要求）：网络 .py 文件导入（下载 → 校验 → imports/py/net-<sha1>/ → 加入源） */
+  cfgImportPyUrl: (url: string) => unwrap(window.api.config.importPyUrl(url)),
   /** ★ 2026-09-29：导入本地包（目录包）—— 返回包根/命中订阅/源数，用于结果提示 */
   cfgImportPackage: (name?: string) => unwrap(window.api.config.importPackage(name)),
   /** ★ 2026-09-29 本地包「网页源」：独立窗口打开 homePage html（fm 桥） */
