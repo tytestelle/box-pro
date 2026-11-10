@@ -14,7 +14,9 @@ import { applyWindowCorner } from './util/windowCorner';
 import { bossKey } from './bossKey';
 import { playerWindow, onPlayerWindowClosed } from './player/PlayerWindow';
 import { playerSettings } from './player/playerSettings';
-import { hostRegexFor } from '../engine/util/m3u8Purify';
+// ★ 2026-11-10（用户要求）：广告屏蔽 —— `hostRegexFor` 取订阅规则，`builtinAdRegex` 取软件内置规则；
+//   两者在 proxy 构造里拼接，因此订阅没写规则也能清洗「赌场/娱乐城」等内置关键词。
+import { hostRegexFor, builtinAdRegex } from '../engine/util/m3u8Purify';
 import { TorrentPlay } from './torrent/torrentPlay';
 import { DavService } from './webdav/DavService';
 import { DlnaService } from './dlna/DlnaService';
@@ -124,11 +126,12 @@ const proxy = new LocalProxyServer(
   fileLogger,
   () => host.driveList(),
   // ★ 2026-09-29 m3u8 去广告注入（默认关，配置页「播放」可开）：
-  //   开关每轮清单回源时现读（改后即时生效）；规则用当前订阅的 rules[].regex 按 host 匹配。
+  //   开关每轮清单回源时现读（改后即时生效）；规则 = 当前订阅的 rules[].regex + 软件内置关键词规则。
+  //   ★ 2026-11-10：`builtinAdRegex()` 单独追加 —— 订阅没写规则时也能清洗「赌场/娱乐城」等内置关键词；
+  //   `adsFor()` 把订阅 `ads` 域名黑名单交给 /play 入口（命中即 204，始终生效，不依赖 m3u8 去广告开关）。
   {
     enabled: () => playerSettings.settings.m3u8Purify,
-    rulesFor: (url) => hostRegexFor(url, host.siteConfig?.rules),
-    // ★ 2026-11-10：订阅 `ads` 域名黑名单（`LocalProxyServer.playProxy` 里命中即 204）
+    rulesFor: (url) => [...hostRegexFor(url, host.siteConfig?.rules), ...builtinAdRegex()],
     adsFor: () => host.siteConfig?.ads || [],
   },
   // ★ 2026-09-29 WebDAV 取流认证（凭据只在主进程加密存储里）
