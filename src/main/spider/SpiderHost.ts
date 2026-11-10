@@ -2666,4 +2666,14 @@ function resolvePathValue(value: string, baseUrl: string): string {
   if (!/^https?:\/\//i.test(baseUrl)) return value;
   const dir = baseUrl.substring(0, baseUrl.lastIndexOf('/') + 1);
   if (!dir) return value;
-  const [head,
+  const [head, ...tail] = v.split(';');
+  let resolved: string;
+  try {
+    resolved = new URL(head, dir).toString();
+  } catch {
+    resolved = head.startsWith('../')
+      ? dir.replace(/[^/]+$/, '')
+      : dir + head.replace(/^\.\//, '');
+  }
+  return [resolved, ...tail].join(';');
+}
