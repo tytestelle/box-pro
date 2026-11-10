@@ -17,6 +17,8 @@ import type { DavServer } from '../../shared/webdav';
 import LiveSubscriptionPanel from '../components/LiveSubscriptionPanel';
 // ★ 2026-10-13（用户要求）：导入直播源弹窗（本地文件 / 网络订阅 + 管理表格）
 import LiveImportModal from '../components/LiveImportModal';
+// ★ 2026-11-10（用户要求）：.py 源导入弹窗（本地文件 / 网络地址）
+import PyImportModal, { type PyImportResult } from '../components/PyImportModal';
 
 type TabId = 'sources' | 'livesub' | 'health' | 'profiles' | 'account' | 'storage' | 'appearance' | 'play' | 'shortcut' | 'network' | 'backup';
 
@@ -80,6 +82,8 @@ export default function ConfigPage() {
   const [lastOk, setLastOk] = useState('');
   // ★ 2026-10-13（用户要求）：导入直播源弹窗开关
   const [liveImportOpen, setLiveImportOpen] = useState(false);
+  // ★ 2026-11-10（用户要求）：.py 源导入弹窗开关（本地 / 网络）
+  const [pyImportOpen, setPyImportOpen] = useState(false);
   // 外观主题
   const [theme, setTheme] = useState<Theme>(() => currentTheme());
   /** ★ 2026-09-30（用户要求）：是否展示「发现」页（默认展示；关掉后导航与默认落地页相应变化） */
@@ -402,8 +406,12 @@ export default function ConfigPage() {
     }
   }
 
-  /** 从本地选择 .py 文件导入为 py 源（经主进程 dialog；入库后与其它源一样可切换） */
-  async function doImportPyLocal() {
+  /**
+   * 从本地选择 .py 文件导入为 py 源（经主进程 dialog；入库后与其它源一样可切换）。
+   * ★ 2026-11-10：函数签名改为返回 PyImportResult，供 PyImportModal 展示结果；
+   *   原来直接由导入区按钮调用，现在改由弹窗调用。
+   */
+  async function doImportPyLocal(): Promise<PyImportResult> {
     setBusy(true);
     setErr('');
     try {
@@ -411,15 +419,46 @@ export default function ConfigPage() {
       if (r.ok) {
         setReport(null);
         setWarn([]);
-        setErr('');
-        // 提示语走 url 区下方的软提示（无 warning 时也显示成功）
         setLastOk(`已导入本地 .py 源：${r.key}`);
         await refresh();
+        return { ok: true, key: r.key };
       }
-      // r.ok=false 且无 error = 用户取消文件选择，静默
-      else if (r.error) setErr(r.error);
+      if (r.error) {
+        setErr(r.error);
+        return { ok: false, error: r.error };
+      }
+      return { ok: false };
     } catch (e) {
       setErr((e as Error).message);
+      return { ok: false, error: (e as Error).message };
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /**
+   * ★ 2026-11-10（用户要求）：从网络 URL 导入 .py 源。
+   *   主进程下载 → 校验 → 写入 imports/py/net-<sha1>/<filename>.py + _meta.json → 加入源列表。
+   *   _meta.json 记录 url + sha256，启动时由主进程 checkPyUpdates() 联网比对，内容变化则重新下载。
+   */
+  async function doImportPyUrl(u: string): Promise<PyImportResult> {
+    setBusy(true);
+    setErr('');
+    try {
+      const r = await client.cfgImportPyUrl(u);
+      if (r.ok) {
+        setLastOk(`已导入网络 .py 源：${r.key}`);
+        await refresh();
+        return { ok: true, key: r.key };
+      }
+      if (r.error) {
+        setErr(r.error);
+        return { ok: false, error: r.error };
+      }
+      return { ok: false };
+    } catch (e) {
+      setErr((e as Error).message);
+      return { ok: false, error: (e as Error).message };
     } finally {
       setBusy(false);
     }
@@ -863,8 +902,10 @@ export default function ConfigPage() {
           <button disabled={busy} onClick={doImportJsonLocal}>
             导入本地 .json 文件
           </button>
-          <button disabled={busy} onClick={doImportPyLocal}>
-            导入本地 .py 文件
+          {/* ★ 2026-11-10（用户要求）：原「导入本地 .py 文件」改为「导入 .py 文件」，
+              点击弹出 PyImportModal（本地文件 / 网络地址 两种方式） */}
+          <button disabled={busy} onClick={() => setPyImportOpen(true)} title="本地文件 或 网络地址（http/https）；添加后立即注册到源列表">
+            导入 .py 文件
           </button>
           {/* ★ 2026-09-29（用户要求）：本地包（影视.json + py/js/jar/html/xbpq 目录） */}
           <button disabled={busy} onClick={doImportPackage}>
@@ -1887,6 +1928,13 @@ export default function ConfigPage() {
         open={liveImportOpen}
         onClose={() => setLiveImportOpen(false)}
         onImportLocalFile={doImportLiveLocal}
+      />
+      {/* ★ 2026-11-10（用户要求）：.py 源导入弹窗（本地文件 / 网络地址） */}
+      <PyImportModal
+        open={pyImportOpen}
+        onClose={() => setPyImportOpen(false)}
+        onImportLocal={doImportPyLocal}
+        onImportUrl={doImportPyUrl}
       />
     </div>
   );
