@@ -403,7 +403,7 @@ export class SpiderHost {
    * ★ 2026-11-10（用户要求）：网络 py 下载 —— 显式 UA / Accept / Referer + 手动重定向 + 重试 + 代理。
    *   ECONNRESET 多半是目标站点对裸请求敏感（GitHub raw / gitee raw / jsdelivr 等），
    *   或国内直连被中间设备重置。这里统一处理，避免每个调用点各写一遍。
-   *   - 最多 5 次 3xx 重定向（undici 默认不自动跟随，需要手动跟）。
+   *   - undici 的 request 默认不跟随重定向（maxRedirections 默认 0），这里手动跟随最多 5 次 3xx。
    *   - 网络层错误（ECONNRESET / ETIMEDOUT / ENOTFOUND / EAI_AGAIN / socket hang up / aborted /
    *     other side closed / ECONNREFUSED）重试 3 次，间隔 500ms、1000ms；HTTP 4xx/5xx 不重试。
    *   - 配置页「网络代理」启用时自动挂 ProxyAgent（GitHub raw 在国内直连必 reset）。
@@ -444,6 +444,7 @@ export class SpiderHost {
       try {
         let current = url;
         for (let hop = 0; hop < 5; hop++) {
+          // undici 的 request 默认不跟随重定向；这里手动跟随 3xx。
           const res = await undiciRequest(current, {
             method: 'GET',
             headers,
