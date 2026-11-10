@@ -32,6 +32,8 @@ const api = {
         result?: { config: SiteConfig; report: ImportReport; warnings: string[]; urls?: { name: string; url: string }[] };
       }>(IPC.CFG_IMPORT_JSON_LOCAL, name),
     importPyLocal: () => invoke<{ ok: boolean; key?: string; error?: string }>(IPC.CFG_IMPORT_PY_LOCAL),
+    // ★ 2026-11-10（用户要求）：网络 .py 文件导入（下载 → 校验 → imports/py/net-<sha1>/ → 加入源）
+    importPyUrl: (url: string) => invoke<{ ok: boolean; key?: string; error?: string }>('cfg:importPyUrl', url),
     importLiveLocal: () =>
       invoke<{ ok: boolean; name?: string; index?: number; replaced?: boolean; total?: number; error?: string }>(IPC.CFG_IMPORT_LIVE_LOCAL),
     importPackage: (name?: string) =>
