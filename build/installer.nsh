@@ -6,16 +6,22 @@
 ;   That would also move "<installDir>/data" (user config / cache / watch history)
 ;   away -> every upgrade would lose user data and re-run "first launch".
 ;
+; !! 2026-11-10 (user request): the local import packages live under
+;   "<installDir>/imports/py/<sourceKey>/" (and similarly for js/jar/html/xbpq).
+;   Those are user-imported sources - they must survive an over-the-top upgrade
+;   exactly like "data" does, otherwise every upgrade breaks the .py sources
+;   ("local .py file does not exist").
+;
 ;   This macro replaces the default file-removal block in the uninstaller:
-;     - update (--updated): KEEP the "data" directory. Every other top-level child is
-;       moved away like the stock logic:
+;     - update (--updated): KEEP "data" and "imports". Every other top-level child
+;       is moved away like the stock logic:
 ;         * directories -> un.atomicRMDir (file-by-file; NSIS Rename handles files
 ;           across volumes but NOT directories, hence the recursion);
 ;         * plain files  -> direct Rename (cross-volume safe for files).
 ;       If a move fails, fall back to delete; if that fails too, leave it (the new
 ;       version overwrites same-named files; the running uninstaller itself cannot be
 ;       moved/deleted - that is expected and handled by NSIS self-deletion).
-;     - full uninstall: same as the default (RMDir /r $INSTDIR, includes data).
+;     - full uninstall: same as the default (RMDir /r $INSTDIR, includes data/imports).
 ;
 ;   NOTES:
 ;     * labels inside an NSIS macro are global after expansion - this macro is inserted
@@ -32,6 +38,7 @@
       StrCmp $R5 "." winboxClearNext
       StrCmp $R5 ".." winboxClearNext
       StrCmp $R5 "data" winboxClearNext
+      StrCmp $R5 "imports" winboxClearNext
       IfFileExists "$INSTDIR\$R5\*.*" winboxClearDir winboxClearFile
     winboxClearDir:
       Push "\$R5"
