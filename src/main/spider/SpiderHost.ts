@@ -250,6 +250,12 @@ export class SpiderHost {
   private lastPrewarmAt = 0;
   private driveBindKeys = new Set<string>();
   private driveBindStore!: JsonStore;
+  /**
+   * ★ 2026-11-10：py 源配置修复的防重入标记。
+   *   repairPySourcePaths() 内部会调 manager.restore，触发 onChange → onUserConfigChange，
+   *   若此时 repairingPyPaths 为 true 则跳过（由构造函数在外层统一应用修复后的配置）。
+   */
+  private repairingPyPaths = false;
   onSearchAllProgress?: (ev: SearchAllProgressEvent) => void;
   torrentPlay?: Pick<TorrentPlay, 'open'>;
   localPkgs?: LocalPkgAccess;
@@ -311,12 +317,87 @@ export class SpiderHost {
     }
     this.manager.setOnChange((snap, kind) => this.onUserConfigChange(snap, kind));
     if (this.manager.load()) {
+      // ★ 2026-11-10：先修复旧配置里指向 resources 的 py api（覆盖安装后文件丢失 → 改指 data/py-sources）
+      this.repairPySourcePaths();
+      // 再应用（修复后的）配置
       this.onUserConfigChange(this.manager.snapshot());
     }
     this.driveBindStore = new JsonStore(join(userDataDir(), 'drive-bind-learned.json'));
     const learned = this.driveBindStore.getObject<unknown>('list', null);
     if (Array.isArray(learned)) {
       for (const k of learned) if (typeof k === 'string' && k) this.driveBindKeys.add(k);
+    }
+  }
+
+  /**
+   * ★ 2026-11-10（用户要求）：py 源配置自愈 —— 旧配置 api 指向 resources 副本，
+   *   覆盖安装替换 resources 后文件丢失。这里扫描所有 py 源：
+   *     · api 指向的文件存在 → 不动；
+   *     · 文件丢失但 data/py-sources 下有同名/同相对路径备份 → 永久改写配置里的 api 指向备份；
+   *     · 都没有 → 记 warning，保持原配置不变（用户重新导入后会自动恢复）。
+   *   改写用 manager.restore 一次性提交（避免逐条 updateSource 触发多次 onChange）。
+   *   restore 触发的 onChange 在本方法内会被 repairingPyPaths 跳过，由构造函数统一应用。
+   */
+  private repairPySourcePaths(): void {
+    if (this.repairingPyPaths) return;
+    this.repairingPyPaths = true;
+    let changed = false;
+    try {
+      const snap = this.manager.snapshot();
+      const pyRoot = join(userDataDir(), 'py-sources');
+      let resRoot = '';
+      try { resRoot = resourcesDir(); } catch { /* ignore */ }
+
+      const newSources = snap.sources.map((s) => {
+        const api = (s.api || '').trim();
+        if (!/\.py(?:[?#;]|$)/i.test(api)) return s;
+
+        const [rawPath, ...rest] = api.split(';');
+        const suffix = rest.length ? ';' + rest.join(';') : '';
+
+        let filePath = '';
+        let isFileUrl = false;
+        try {
+          if (/^file:\/\//i.test(rawPath)) {
+            isFileUrl = true;
+            filePath = fileURLToPath(rawPath);
+          } else if (/^[A-Za-z]:[/\\]/.test(rawPath) || rawPath.startsWith('/')) {
+            filePath = rawPath;
+          } else {
+            return s; // 相对路径 / 网络 URL：不处理
+          }
+        } catch {
+          return s;
+        }
+
+        if (existsSync(filePath)) return s; // 原文件在，不动
+
+        // 原文件丢失：在 data/py-sources 里按相对路径 / basename 找备份
+        let rel = '';
+        if (resRoot) {
+          try { rel = relative(resRoot, filePath); } catch { rel = ''; }
+        }
+        const candidates: string[] = [];
+        if (rel && !rel.startsWith('..')) candidates.push(join(pyRoot, rel));
+        candidates.push(join(pyRoot, basename(filePath)));
+        const hit = candidates.find((p) => existsSync(p));
+        if (!hit) {
+          this.logger.w(`py 源缺失且无备份：${s.key} | ${filePath}`);
+          return s;
+        }
+        const newApi = (isFileUrl ? pathToFileURL(hit).toString() : hit) + suffix;
+        this.logger.i(`py 源配置已修复：${s.key} | ${filePath} → ${hit}`);
+        changed = true;
+        return { ...s, api: newApi };
+      });
+
+      if (changed) {
+        this.manager.restore({ ...snap, sources: newSources });
+      }
+    } catch (e) {
+      this.logger.w(`py 源配置修复失败：${(e as Error).message}`);
+    } finally {
+      this.repairingPyPaths = false;
     }
   }
 
@@ -2367,11 +2448,10 @@ export class SpiderHost {
   }
 
   /**
-   * ★ 2026-11-10（用户要求）：py 源路径回退 —— resources 下的 py 文件在覆盖安装时会被清空，
-   *   data/py-sources 下保留副本。如果 api 指向的资源文件不存在，自动回退到 data/py-sources 下的对应文件。
-   *   - 只处理本地绝对路径（file:// 或 Windows 绝对路径）；HTTP 远程 py 不动。
-   *   - 只处理 .py 后缀；其它类型不动。
-   *   - api 可能带 `;param` 后缀（CatVod 的 md5 等），回退时保留。
+   * ★ 2026-11-10（用户要求）：py 源运行时兜底 —— 万一 repairPySourcePaths 没修到（例如
+   *   启动后用户手动删了 resources 下的文件），applyConfig 时再检查一次：
+   *   api 指向的资源文件不存在时，回退到 data/py-sources 下的同名/同相对路径文件。
+   *   注意：这里只改内存里的 SourceBean，不写回配置；永久修复由 repairPySourcePaths 负责。
    */
   private resolvePySourcePath(src: SourceBean): SourceBean {
     const api = (src.api || '').trim();
@@ -2395,10 +2475,8 @@ export class SpiderHost {
       return src;
     }
 
-    // 文件存在 → 保留原样
     if (existsSync(filePath)) return src;
 
-    // 从 resources 根推导相对路径
     let rel = '';
     try {
       const resRoot = resourcesDir();
@@ -2406,25 +2484,22 @@ export class SpiderHost {
     } catch { /* ignore */ }
     if (!rel || rel.startsWith('..')) rel = basename(filePath);
 
-    // 在 data/py-sources 下查找
     const pyRoot = join(userDataDir(), 'py-sources');
     const candidates = [join(pyRoot, rel), join(pyRoot, basename(filePath))];
     for (const cand of candidates) {
       if (existsSync(cand)) {
         const newPath = isFileUrl ? pathToFileURL(cand).toString() : cand;
         const newApi = newPath + paramSuffix;
-        this.logger.i(`py 源回退：${src.key} | ${filePath} → ${cand}`);
+        this.logger.i(`py 源回退（运行时）：${src.key} | ${filePath} → ${cand}`);
         return { ...src, api: newApi };
       }
     }
-
-    this.logger.w(`py 源缺失：${src.key} | ${filePath}（data/py-sources 下也未找到）`);
     return src;
   }
 
   private applyConfig(cfg: SiteConfig): void {
     this.sourceMap.clear();
-    // ★ 2026-11-10：py 源路径回退（resources 缺失时改指 data/py-sources）
+    // ★ 2026-11-10：py 源运行时兜底（resources 缺失时改指 data/py-sources，仅本次内存）
     for (const s of cfg.sites) this.sourceMap.set(s.key, this.resolvePySourcePath(s));
     this.setSpiderJar(cfg.spider);
   }
@@ -2440,6 +2515,8 @@ export class SpiderHost {
 
   private onUserConfigChange(snap: UserConfig, kind: ConfigChangeKind = 'content'): void {
     if (kind === 'ui') return;
+    // ★ 2026-11-10：repairPySourcePaths 内部 restore 会触发本方法，跳过，由构造函数统一应用
+    if (this.repairingPyPaths) return;
     // ★ 2026-10-14：直播源列表可能变了（新增/删除/重排）→ 清缓存，避免展示旧源的频道
     this.invalidateLiveCache();
     const base = snap.apiUrl || '';
@@ -2489,7 +2566,7 @@ function resolvePathValue(value: string, baseUrl: string): string {
     resolved = new URL(head, dir).toString();
   } catch {
     resolved = head.startsWith('../')
-      ? dir.replace(/[^/]+\/$/, '')
+      ? dir.replace(/[^/]+$/, '')
       : dir + head.replace(/^\.\//, '');
   }
   return [resolved, ...tail].join(';');
