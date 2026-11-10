@@ -409,15 +409,54 @@ export class SpiderHost {
   }
 
   /**
+   * ★ 2026-11-10（用户反馈）：GitHub 网页查看器链接（/blob/）返回的是 HTML 页面，不是文件内容。
+   *   这里把 github.com/<user>/<repo>/(blob|raw)/<branch>/<path> 统一改写为
+   *   raw.githubusercontent.com/<user>/<repo>/<branch>/<path>；同时去掉 ?raw=true 等查询串。
+   *   - 已经是 raw.githubusercontent.com / gist 直链 / 其它域名 → 原样返回。
+   *   - 只处理 .py 场景下的常见形态，不做 gist API 复杂处理。
+   */
+  private normalizeGithubBlobUrl(raw: string): string {
+    const url = (raw || '').trim();
+    if (!url) return url;
+    try {
+      // github.com/<user>/<repo>/blob/<branch>/<path> 或 /raw/<branch>/<path>
+      const m = /^https?:\/\/github\.com\/([^/]+)\/([^/]+)\/(?:blob|raw)\/([^/]+)\/(.+)$/i.exec(url);
+      if (m) {
+        const user = m[1];
+        const repo = m[2];
+        const branch = m[3];
+        const rest = m[4];
+        // 去掉查询串 / 锚点（例如 ?raw=true、#L10）
+        const path = rest.replace(/[?#].*$/, '');
+        if (!path) return url;
+        const out = `https://raw.githubusercontent.com/${user}/${repo}/${branch}/${path}`;
+        if (out !== url) this.logger.i(`py 下载：GitHub 链接已改写 ${url} → ${out}`);
+        return out;
+      }
+      // github.com/<user>/<repo>?raw=true 或 .../blob/...?raw=true 的兜底（极少见）
+      if (/^https?:\/\/github\.com\//i.test(url) && /[?&]raw=true\b/i.test(url)) {
+        const cleaned = url.replace(/([?&])raw=true\b/i, '$1').replace(/[?&]$/, '');
+        return this.normalizeGithubBlobUrl(cleaned);
+      }
+    } catch {
+      /* 解析失败保持原样 */
+    }
+    return url;
+  }
+
+  /**
    * ★ 2026-11-10（用户要求）：网络 py 下载 —— 自动识别墙外地址并加速。
+   *   - 先把 GitHub 网页查看器链接（/blob/、/raw/）改写为 raw.githubusercontent.com 直链；
    *   - GitHub 类（github.com / raw.githubusercontent.com / gist.githubusercontent.com / codeload 等）：
-   *     走 githubAccelerator（GH_ACCEL_PREFIXES 测速排名 + 按序尝试 + 1MB/s 速度门限自动换线）。
-   *   - 非 GitHub：直接单线路下载。
-   *   - 配置页「网络代理」启用时，dispatcher 挂 ProxyAgent（用户代理优先生效；GitHub 加速器仍会尝试各前缀）。
+   *     走 githubAccelerator（GH_ACCEL_PREFIXES 测速排名 + 按序尝试 + 1MB/s 速度门限自动换线）；
+   *   - 非 GitHub：直接单线路下载；
+   *   - 配置页「网络代理」启用时，dispatcher 挂 ProxyAgent。
    */
   private async downloadPySource(url: string): Promise<Buffer> {
-    const u = (url || '').trim();
-    if (!u) throw new Error('地址为空');
+    const raw = (url || '').trim();
+    if (!raw) throw new Error('地址为空');
+
+    const normalized = this.normalizeGithubBlobUrl(raw);
 
     const proxy = getProxySettings();
     let dispatcher: import('undici').Dispatcher | undefined;
@@ -432,20 +471,23 @@ export class SpiderHost {
     }
 
     const log = (s: string) => this.logger.i(`py 下载：${s}`);
-    return downloadWithAccel(u, { dispatcher, log });
+    return downloadWithAccel(normalized, { dispatcher, log });
   }
 
   /**
    * ★ 2026-11-10（用户要求）：从网络 URL 导入 .py 源。
    *   下载（见 downloadPySource：GitHub 自动加速，非 GitHub 直接下载）→ 校验（非空、非 HTML、像 Python）
    *   → 写入 imports/py/net-<sha1>/<filename>.py + _meta.json → 构造 SourceBean 加入配置。
-   *   _meta.json 记录 url + sha256，启动时由 checkPyUpdates() 联网比对，内容变化则重新下载。
+   *   _meta.json 记录规范化后的 url + sha256，启动时由 checkPyUpdates() 联网比对，内容变化则重新下载。
    *   文件落在 imports 下，覆盖安装由 build/installer.nsh 保留（与本地 .py 导入同一目录）。
    *   单文件导入：不处理 py 内部引用的其它文件（与本地单文件导入语义一致）。
    */
   async importPyFromUrl(url: string, name?: string): Promise<{ key: string; file: string }> {
-    const u = (url || '').trim();
-    if (!/^https?:\/\//i.test(u)) throw new Error('请填写 http(s):// 开头的 .py 文件地址');
+    const rawInput = (url || '').trim();
+    if (!/^https?:\/\//i.test(rawInput)) throw new Error('请填写 http(s):// 开头的 .py 文件地址');
+
+    // 先规范化（GitHub 网页链接 → raw 直链），后面下载 / 存 _meta / 文件名解析都用规范化的
+    const u = this.normalizeGithubBlobUrl(rawInput);
 
     // 1) 下载（GitHub 自动加速，见 downloadPySource）
     const body = await this.downloadPySource(u);
@@ -486,7 +528,7 @@ export class SpiderHost {
       throw new Error(`写入失败：${(e as Error).message}`);
     }
 
-    // 5) _meta.json（url + sha256 + name + 时间戳），供 checkPyUpdates 比对
+    // 5) _meta.json（规范化后的 url + sha256 + name + 时间戳），供 checkPyUpdates 比对
     const sha256 = createHash('sha256').update(body).digest('hex');
     try {
       writeFileSync(
@@ -533,6 +575,7 @@ export class SpiderHost {
    *     → 与 _meta.sha256 不同 → 覆盖文件、更新 _meta；
    *     相同 → 只更新 lastCheckedAt；失败 → 记 warning，不影响其它源。
    *   启动后由 src/main/index.ts 延迟调用一次；后续可挂按钮/定时器按需调用。
+   *   ★ _meta.url 里如果是历史遗留的 GitHub 网页链接，downloadPySource 内部也会再规范化一次。
    */
   async checkPyUpdates(): Promise<{ updated: number; checked: number; failed: number }> {
     const pyRoot = join(localImportsDir(), 'py');
@@ -2623,14 +2666,4 @@ function resolvePathValue(value: string, baseUrl: string): string {
   if (!/^https?:\/\//i.test(baseUrl)) return value;
   const dir = baseUrl.substring(0, baseUrl.lastIndexOf('/') + 1);
   if (!dir) return value;
-  const [head, ...tail] = v.split(';');
-  let resolved: string;
-  try {
-    resolved = new URL(head, dir).toString();
-  } catch {
-    resolved = head.startsWith('../')
-      ? dir.replace(/[^/]+$/, '')
-      : dir + head.replace(/^\.\//, '');
-  }
-  return [resolved, ...tail].join(';');
-}
+  const [head,
