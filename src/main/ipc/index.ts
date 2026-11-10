@@ -45,6 +45,8 @@ import type { MpvCommand, MpvStartOptions } from '../../shared/player';
 // Boss key
 import { bossKey, BOSS_DEFAULT_ACCEL } from '../bossKey';
 import { playerSettings } from '../player/playerSettings';
+// ★ 2026-11-10（用户要求）：广告关键词设置（配置页「m3u8 去广告 · 规则」按钮读写）
+import { adKeywordSettings } from '../player/adKeywordSettings';
 import { detectPlayers, launchPlayer, seekArgs } from '../torrent/externalPlayer';
 import { ok } from '../../shared/ipc-result';
 import type { IpcMainInvokeEvent } from 'electron';
@@ -350,6 +352,12 @@ export function registerIpc(host: SpiderHost, dav: DavService, dlna: DlnaService
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }
   }, log);
+
+  // ★ 2026-11-10（用户要求）：广告关键词读写（配置页「m3u8 去广告 · 规则」按钮）。
+  //   `strong` / `weak` 传 undefined = 不改；传 [] = 用户显式清空（不再回落到默认）。
+  registerHandler('ad-keywords:get', () => adKeywordSettings.settings, log);
+  registerHandler('ad-keywords:set', (_e: any, patch: Partial<{ strong: string[]; weak: string[] }>) =>
+    adKeywordSettings.update(patch || {}), log);
 
   registerHandler(IPC.CFG_IMPORT_PACKAGE, async (e: any, customName?: string): Promise<{
     ok: boolean; root?: string; rel?: string; sites?: number; name?: string; error?: string;
