@@ -157,8 +157,8 @@ function isDev(): boolean {
 
 /**
  * ★ 2026-11-10（用户要求）：py 源文件迁移 —— 覆盖安装替换 resources，data 目录保留。
- *   启动时把 resources 下的所有 .py 复制到 data/py-sources/（保持相对路径，已存在则跳过），
- *   之后加载器在 resources 缺失时自动回退到 data/py-sources。
+ *   启动时把 resources 下的所有 .py 复制到 data/py-sources/（保持相对路径，已存在则跳过）。
+ *   SpiderHost.repairPySourcePaths 随后会把配置里指向 resources 的 api 改指到这里。
  */
 function migratePySourcesToUserData(): void {
   let resRoot: string;
