@@ -69,14 +69,17 @@ const escapeRegex = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$
 /**
  * 构建内置 M3U8 清洗正则：删除「含广告关键词的 EXTINF + URI 行对」。
  * 关键词同时以原文与 URL 编码形式出现（M3U8 里 URL 通常已 percent-encode）。
+ * ★ 2026-11-10：关键词去重，避免 `casino` / `gambling` 这类纯 ASCII 词重复出现。
  */
 function buildBuiltinAdRegex(): string[] {
   const all = [...BUILTIN_AD_KEYWORDS_STRONG, ...BUILTIN_AD_KEYWORDS_WEAK];
-  const encoded: string[] = [];
+  const uniq = new Set<string>();
   for (const k of all) {
-    try { encoded.push(encodeURIComponent(k)); } catch { /* 忽略无法编码的关键词 */ }
+    if (!k) continue;
+    uniq.add(k);
+    try { uniq.add(encodeURIComponent(k)); } catch { /* 忽略无法编码的关键词 */ }
   }
-  const patterns = [...all, ...encoded].map(escapeRegex).join('|');
+  const patterns = [...uniq].map(escapeRegex).join('|');
   if (!patterns) return [];
   return [
     // 删除含关键词的 EXTINF+URI 行对（整段切片）
@@ -1025,29 +1028,33 @@ function runLevels(tsUrlPre: string, content: string, rules: string[], st: Purif
 }
 
 /**
- * 订阅 rules 里「该播放地址所属 host」的 regex 规则表 + 软件内置广告规则。
- *
- * ★ 2026-11-10：
- *   ① 兼容 TVBox 标准的 `hosts: string[]`（复数）与旧配置的 `host: string`（单数）；
- *   ② 内置广告关键词规则**始终追加**到结果末尾 —— 订阅没写规则也能清「赌场/娱乐城」等。
- *   上游语义「第一个 host 命中即停止匹配后续 rule 项」保持不变。
+ * 订阅 rules 里「该播放地址所属 host」的 regex 规则表。
+ * ★ 2026-11-10：兼容 TVBox 标准的 `hosts: string[]`（复数）与旧配置的 `host: string`（单数）。
+ *   上游 M3u8.java 的 host 判定语义是「播放地址包含任一 host 片段」，这里保持一致。
+ *   ★ 契约：只返回**订阅规则**命中结果；没命中 host / 没规则 → 空数组。
+ *     软件内置规则由 `builtinAdRegex()` 单独提供，调用方自行拼接（见 main/index.ts）。
  */
 export function hostRegexFor(tsUrlPre: string, rules: RuleItem[] | null | undefined): string[] {
-  const out: string[] = [];
   for (const r of rules || []) {
     const hosts = Array.isArray(r?.hosts)
       ? r.hosts.map((h) => String(h || '').trim()).filter(Boolean)
       : (typeof r?.host === 'string' && r.host.trim() ? [r.host.trim()] : []);
     if (!hosts.length) continue;
     if (!hosts.some((h) => tsUrlPre.includes(h))) continue;
-    if (Array.isArray(r.regex)) {
-      for (const s of r.regex) if (typeof s === 'string' && s.length > 0) out.push(s);
-    }
-    break; // 上游语义：第一条命中 hosts 的 rule 生效后不再继续
+    if (!Array.isArray(r.regex)) continue;
+    return r.regex.filter((s) => typeof s === 'string' && s.length > 0);
   }
-  // ★ 内置规则兜底（去重）
-  for (const re of BUILTIN_AD_REGEX) if (!out.includes(re)) out.push(re);
-  return out;
+  return [];
+}
+
+/**
+ * ★ 2026-11-10（用户要求）：软件内置广告关键词规则（赌场/娱乐城/博彩/…）。
+ *   与订阅规则解耦，独立导出；调用方在需要时拼接：
+ *     `[...hostRegexFor(url, rules), ...builtinAdRegex()]`
+ *   返回的每一项都可直接交给 `purifyM3u8` 的 `rules` 参数。
+ */
+export function builtinAdRegex(): string[] {
+  return BUILTIN_AD_REGEX.slice();
 }
 
 /**
