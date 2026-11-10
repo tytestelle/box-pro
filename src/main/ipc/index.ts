@@ -339,6 +339,18 @@ export function registerIpc(host: SpiderHost, dav: DavService, dlna: DlnaService
     }
   }, log);
 
+  // ★ 2026-11-10（用户要求）：从网络 URL 导入 .py 源。
+  //   下载 / 校验 / 写入 imports/py/net-<sha1>/<filename>.py + _meta.json 由 SpiderHost.importPyFromUrl 完成；
+  //   这里只做 IPC 转发与错误包装。channel 直接用字符串（同 'player:close'），不改 IPC 常量表。
+  registerHandler('cfg:importPyUrl', async (_e: any, url: string): Promise<{ ok: boolean; key?: string; error?: string }> => {
+    try {
+      const r = await host.importPyFromUrl(String(url || ''));
+      return { ok: true, key: r.key };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }, log);
+
   registerHandler(IPC.CFG_IMPORT_PACKAGE, async (e: any, customName?: string): Promise<{
     ok: boolean; root?: string; rel?: string; sites?: number; name?: string; error?: string;
     warnings?: string[];
