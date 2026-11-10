@@ -51,7 +51,8 @@ import {
   wrapPlayUrl,
   wrapPlayUrlWithHeaders,
 } from '../../shared/driveProvider';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename, relative } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { directPlayUrlError } from '../../shared/playbackResult';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { JarSpiderBridge, normalizeJarUrl } from '../../engine/spider/JarSpiderBridge';
@@ -2365,9 +2366,66 @@ export class SpiderHost {
     return mgr.refreshEpg();
   }
 
+  /**
+   * ★ 2026-11-10（用户要求）：py 源路径回退 —— resources 下的 py 文件在覆盖安装时会被清空，
+   *   data/py-sources 下保留副本。如果 api 指向的资源文件不存在，自动回退到 data/py-sources 下的对应文件。
+   *   - 只处理本地绝对路径（file:// 或 Windows 绝对路径）；HTTP 远程 py 不动。
+   *   - 只处理 .py 后缀；其它类型不动。
+   *   - api 可能带 `;param` 后缀（CatVod 的 md5 等），回退时保留。
+   */
+  private resolvePySourcePath(src: SourceBean): SourceBean {
+    const api = (src.api || '').trim();
+    if (!/\.py(?:[?#;]|$)/i.test(api)) return src;
+
+    const [rawPath, ...restParams] = api.split(';');
+    const paramSuffix = restParams.length ? ';' + restParams.join(';') : '';
+
+    let filePath = '';
+    let isFileUrl = false;
+    try {
+      if (/^file:\/\//i.test(rawPath)) {
+        isFileUrl = true;
+        filePath = fileURLToPath(rawPath);
+      } else if (/^[A-Za-z]:[/\\]/.test(rawPath) || rawPath.startsWith('/')) {
+        filePath = rawPath;
+      } else {
+        return src; // HTTP 或相对路径，不处理
+      }
+    } catch {
+      return src;
+    }
+
+    // 文件存在 → 保留原样
+    if (existsSync(filePath)) return src;
+
+    // 从 resources 根推导相对路径
+    let rel = '';
+    try {
+      const resRoot = resourcesDir();
+      if (resRoot) rel = relative(resRoot, filePath);
+    } catch { /* ignore */ }
+    if (!rel || rel.startsWith('..')) rel = basename(filePath);
+
+    // 在 data/py-sources 下查找
+    const pyRoot = join(userDataDir(), 'py-sources');
+    const candidates = [join(pyRoot, rel), join(pyRoot, basename(filePath))];
+    for (const cand of candidates) {
+      if (existsSync(cand)) {
+        const newPath = isFileUrl ? pathToFileURL(cand).toString() : cand;
+        const newApi = newPath + paramSuffix;
+        this.logger.i(`py 源回退：${src.key} | ${filePath} → ${cand}`);
+        return { ...src, api: newApi };
+      }
+    }
+
+    this.logger.w(`py 源缺失：${src.key} | ${filePath}（data/py-sources 下也未找到）`);
+    return src;
+  }
+
   private applyConfig(cfg: SiteConfig): void {
     this.sourceMap.clear();
-    for (const s of cfg.sites) this.sourceMap.set(s.key, s);
+    // ★ 2026-11-10：py 源路径回退（resources 缺失时改指 data/py-sources）
+    for (const s of cfg.sites) this.sourceMap.set(s.key, this.resolvePySourcePath(s));
     this.setSpiderJar(cfg.spider);
   }
 
