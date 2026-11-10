@@ -67,6 +67,12 @@ const api = {
       return () => ipcRenderer.removeListener(IPC.NAV_DRIVE_BIND, l);
     },
   },
+  // ★ 2026-11-10（用户要求）：广告关键词读写（配置页「m3u8 去广告 · 规则」按钮）
+  adKeywords: {
+    get: () => invoke<{ strong: string[]; weak: string[] }>('ad-keywords:get'),
+    set: (patch: Partial<{ strong: string[]; weak: string[] }>) =>
+      invoke<{ strong: string[]; weak: string[] }>('ad-keywords:set', patch),
+  },
   vod: {
     home: (key: string) => invoke(IPC.VOD_HOME, key),
     category: (a: { key: string; tid: string; pg: string; extend?: Record<string, string> }) => invoke(IPC.VOD_CATEGORY, a),
