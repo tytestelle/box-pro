@@ -134,6 +134,8 @@ import { DiscoverArtwork } from '../meta/discoverArtwork';
 import { ParseService } from '../parse/ParseService';
 import { sniffMediaUrl } from '../parse/PageSniffer';
 import { getProxySettings, jvmProxyArgs, childProxyEnv } from '../net/proxy';
+// ★ 2026-11-10（用户要求）：GitHub 加速下载器（移植自 main.js：测速 + 换线 + 速度门限）
+import { downloadWithAccel } from './githubAccelerator';
 
 /** 豆瓣兜底最多尝试的名称变体数 */
 const DOUBAN_MAX_VARIANTS = 2;
@@ -251,6 +253,8 @@ export class SpiderHost {
   private lastPrewarmAt = 0;
   private driveBindKeys = new Set<string>();
   private driveBindStore!: JsonStore;
+  /** ★ 2026-11-10：py 下载专用 ProxyAgent（复用连接池；配置变更时由 resetPyProxyAgent 重建） */
+  private pyProxyAgent?: import('undici').ProxyAgent;
   onSearchAllProgress?: (ev: SearchAllProgressEvent) => void;
   torrentPlay?: Pick<TorrentPlay, 'open'>;
   localPkgs?: LocalPkgAccess;
@@ -399,91 +403,42 @@ export class SpiderHost {
     return this.manager.updateSource(key, patch);
   }
 
+  /** ★ 2026-11-10：代理配置变更时重建 py 下载的 ProxyAgent（避免使用旧代理） */
+  resetPyProxyAgent(): void {
+    this.pyProxyAgent = undefined;
+  }
+
   /**
-   * ★ 2026-11-10（用户要求）：网络 py 下载 —— 显式 UA / Accept / Referer + 手动重定向 + 重试 + 代理。
-   *   ECONNRESET 多半是目标站点对裸请求敏感（GitHub raw / gitee raw / jsdelivr 等），
-   *   或国内直连被中间设备重置。这里统一处理，避免每个调用点各写一遍。
-   *   - undici 的 request 默认不跟随重定向（maxRedirections 默认 0），这里手动跟随最多 5 次 3xx。
-   *   - 网络层错误（ECONNRESET / ETIMEDOUT / ENOTFOUND / EAI_AGAIN / socket hang up / aborted /
-   *     other side closed / ECONNREFUSED）重试 3 次，间隔 500ms、1000ms；HTTP 4xx/5xx 不重试。
-   *   - 配置页「网络代理」启用时自动挂 ProxyAgent（GitHub raw 在国内直连必 reset）。
+   * ★ 2026-11-10（用户要求）：网络 py 下载 —— 自动识别墙外地址并加速。
+   *   - GitHub 类（github.com / raw.githubusercontent.com / gist.githubusercontent.com / codeload 等）：
+   *     走 githubAccelerator（GH_ACCEL_PREFIXES 测速排名 + 按序尝试 + 1MB/s 速度门限自动换线）。
+   *   - 非 GitHub：直接单线路下载。
+   *   - 配置页「网络代理」启用时，dispatcher 挂 ProxyAgent（用户代理优先生效；GitHub 加速器仍会尝试各前缀）。
    */
   private async downloadPySource(url: string): Promise<Buffer> {
+    const u = (url || '').trim();
+    if (!u) throw new Error('地址为空');
+
     const proxy = getProxySettings();
     let dispatcher: import('undici').Dispatcher | undefined;
     if (proxy.enabled && proxy.url) {
       try {
         const { ProxyAgent } = await import('undici');
-        dispatcher = new ProxyAgent(proxy.url);
+        if (!this.pyProxyAgent) this.pyProxyAgent = new ProxyAgent(proxy.url);
+        dispatcher = this.pyProxyAgent;
       } catch (e) {
         this.logger.w(`py 下载：代理初始化失败（${proxy.url}）—— ${(e as Error).message}，改直连`);
       }
     }
 
-    const UA =
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-      '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-    const headers: Record<string, string> = {
-      'user-agent': UA,
-      accept: 'text/plain,application/octet-stream,*/*',
-      'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
-    };
-    try {
-      const u = new URL(url);
-      headers.referer = `${u.protocol}//${u.host}/`;
-    } catch {
-      /* URL 非法交给下面 request 报错 */
-    }
-
-    let lastErr: unknown = null;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      if (attempt > 0) {
-        await new Promise((r) => setTimeout(r, 500 * attempt));
-        this.logger.w(`py 下载重试 ${attempt}/3：${url}`);
-      }
-      try {
-        let current = url;
-        for (let hop = 0; hop < 5; hop++) {
-          // undici 的 request 默认不跟随重定向；这里手动跟随 3xx。
-          const res = await undiciRequest(current, {
-            method: 'GET',
-            headers,
-            headersTimeout: 30_000,
-            bodyTimeout: 30_000,
-            dispatcher,
-          });
-          if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-            const next = new URL(String(res.headers.location), current).toString();
-            res.body.destroy();
-            this.logger.i(`py 下载重定向 ${res.statusCode}：${current} → ${next}`);
-            current = next;
-            continue;
-          }
-          if (res.statusCode < 200 || res.statusCode >= 300) {
-            res.body.destroy();
-            throw new Error(`HTTP ${res.statusCode}（${current}）`);
-          }
-          const buf = Buffer.from(await res.body.arrayBuffer());
-          if (proxy.enabled && proxy.url) this.logger.i(`py 下载成功（经代理 ${proxy.url}）：${url} → ${buf.length}B`);
-          return buf;
-        }
-        throw new Error('重定向次数过多（>5）');
-      } catch (e) {
-        lastErr = e;
-        const msg = (e as Error).message || '';
-        // 只对网络层可重试错误重试；HTTP 4xx/5xx 直接抛
-        if (!/ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|aborted|other side closed|ECONNREFUSED/i.test(msg)) {
-          throw e;
-        }
-      }
-    }
-    throw new Error(`下载失败（已重试 3 次）：${(lastErr as Error)?.message || String(lastErr)}`);
+    const log = (s: string) => this.logger.i(`py 下载：${s}`);
+    return downloadWithAccel(u, { dispatcher, log });
   }
 
   /**
    * ★ 2026-11-10（用户要求）：从网络 URL 导入 .py 源。
-   *   下载（见 downloadPySource）→ 校验（非空、非 HTML、像 Python）→ 写入 imports/py/net-<sha1>/<filename>.py + _meta.json
-   *   → 构造 SourceBean 加入配置。
+   *   下载（见 downloadPySource：GitHub 自动加速，非 GitHub 直接下载）→ 校验（非空、非 HTML、像 Python）
+   *   → 写入 imports/py/net-<sha1>/<filename>.py + _meta.json → 构造 SourceBean 加入配置。
    *   _meta.json 记录 url + sha256，启动时由 checkPyUpdates() 联网比对，内容变化则重新下载。
    *   文件落在 imports 下，覆盖安装由 build/installer.nsh 保留（与本地 .py 导入同一目录）。
    *   单文件导入：不处理 py 内部引用的其它文件（与本地单文件导入语义一致）。
@@ -492,7 +447,7 @@ export class SpiderHost {
     const u = (url || '').trim();
     if (!/^https?:\/\//i.test(u)) throw new Error('请填写 http(s):// 开头的 .py 文件地址');
 
-    // 1) 下载（显式 UA / Referer + 重试 + 代理，见 downloadPySource）
+    // 1) 下载（GitHub 自动加速，见 downloadPySource）
     const body = await this.downloadPySource(u);
     if (!body.length) throw new Error('下载内容为空');
     if (body.length > 8 * 1024 * 1024) throw new Error('文件过大（>8MB），不像普通 .py 源');
@@ -574,7 +529,7 @@ export class SpiderHost {
   /**
    * ★ 2026-11-10（用户要求）：联网检查网络 py 源是否有更新。
    *   遍历 imports/py/ 下所有含 _meta.json 的子目录：
-   *     GET 原 url（同 downloadPySource：UA / Referer / 重试 / 代理）→ 计算 sha256
+   *     GET 原 url（同 downloadPySource：GitHub 自动加速 / 代理 / 重试）→ 计算 sha256
    *     → 与 _meta.sha256 不同 → 覆盖文件、更新 _meta；
    *     相同 → 只更新 lastCheckedAt；失败 → 记 warning，不影响其它源。
    *   启动后由 src/main/index.ts 延迟调用一次；后续可挂按钮/定时器按需调用。
@@ -1859,6 +1814,7 @@ export class SpiderHost {
 
   resetSpidersForProxyChange(): void {
     this.vm.spiderFactory.clear();
+    this.resetPyProxyAgent();
   }
 
   resetSpidersAfterDriveChange(): void {
