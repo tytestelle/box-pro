@@ -49,6 +49,66 @@ const AD_DOMAIN_KEYWORDS = [
 const MAX_FRAME_RATE_AD_BLOCK_SIZE = 12; // M3u8.java:46
 const TIMES_NO_AD = 15; // M3u8.java:106
 
+// ───────────────────────── ★ 2026-11-10：内置广告关键词（用户要求） ─────────────────────────
+/**
+ * 强关键词：URL path segment / domain label **完整命中**即拦截（误伤风险低）。
+ * 也用于 M3U8 清单清洗。
+ */
+const BUILTIN_AD_KEYWORDS_STRONG: string[] = [
+  '赌场', '娱乐城', '博彩', 'casino', 'gambling', 'bet365',
+];
+/**
+ * 弱关键词：只在 M3U8 清单清洗里用（需要 EXTINF 上下文判断，避免误伤正片）。
+ */
+const BUILTIN_AD_KEYWORDS_WEAK: string[] = [
+  'poker', '葡京', '太阳城', '威尼斯人', '银河娱乐', '网赌',
+];
+
+const escapeRegex = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * 构建内置 M3U8 清洗正则：删除「含广告关键词的 EXTINF + URI 行对」。
+ * 关键词同时以原文与 URL 编码形式出现（M3U8 里 URL 通常已 percent-encode）。
+ */
+function buildBuiltinAdRegex(): string[] {
+  const all = [...BUILTIN_AD_KEYWORDS_STRONG, ...BUILTIN_AD_KEYWORDS_WEAK];
+  const encoded: string[] = [];
+  for (const k of all) {
+    try { encoded.push(encodeURIComponent(k)); } catch { /* 忽略无法编码的关键词 */ }
+  }
+  const patterns = [...all, ...encoded].map(escapeRegex).join('|');
+  if (!patterns) return [];
+  return [
+    // 删除含关键词的 EXTINF+URI 行对（整段切片）
+    `#EXTINF:[^\\n]*\\n[^\\n#]*(?:${patterns})[^\\n]*\\n`,
+  ];
+}
+
+const BUILTIN_AD_REGEX: string[] = buildBuiltinAdRegex();
+
+/**
+ * ★ 2026-11-10：URL 是否为广告（供 LocalProxyServer 在 `/play` 入口直接拦截）。
+ *   判定规则：hostname 的每个 label、pathname 的每个 segment 解码后，**完整命中**强关键词。
+ *   例：`casino.example.com/x.ts` 命中；`casino-xxx.ts` 不命中（避免误伤）。
+ */
+export function isAdKeywordUrl(url: string): boolean {
+  try {
+    const u = new URL(url);
+    for (const label of u.hostname.split('.')) {
+      if (label && BUILTIN_AD_KEYWORDS_STRONG.includes(label.toLowerCase())) return true;
+    }
+    for (const seg of u.pathname.split('/')) {
+      if (!seg) continue;
+      let d = seg;
+      try { d = decodeURIComponent(seg); } catch { /* 保持原样 */ }
+      if (BUILTIN_AD_KEYWORDS_STRONG.includes(d.toLowerCase())) return true;
+    }
+  } catch {
+    /* 非法 URL 不拦截 */
+  }
+  return false;
+}
+
 export interface PurifyResult {
   /** 清洗后的清单文本（removed === 0 时调用方仍应用原文，见文件头「调用口径」） */
   text: string;
@@ -965,18 +1025,29 @@ function runLevels(tsUrlPre: string, content: string, rules: string[], st: Purif
 }
 
 /**
- * 订阅 rules 里「该播放地址所属 host」的 regex 规则表（对位 VideoParseRuler.getHostsRegex + M3u8.getRegex:501-511）。
- * 语义与上游一致：**第一个** host 命中（且该条带 regex 列表）即返回，不再往下找。
+ * 订阅 rules 里「该播放地址所属 host」的 regex 规则表 + 软件内置广告规则。
+ *
+ * ★ 2026-11-10：
+ *   ① 兼容 TVBox 标准的 `hosts: string[]`（复数）与旧配置的 `host: string`（单数）；
+ *   ② 内置广告关键词规则**始终追加**到结果末尾 —— 订阅没写规则也能清「赌场/娱乐城」等。
+ *   上游语义「第一个 host 命中即停止匹配后续 rule 项」保持不变。
  */
 export function hostRegexFor(tsUrlPre: string, rules: RuleItem[] | null | undefined): string[] {
+  const out: string[] = [];
   for (const r of rules || []) {
-    const host = (r?.host || '').trim();
-    if (!host || !tsUrlPre.includes(host)) continue;
-    if (!Array.isArray(r.regex)) continue;
-    // 只在「本播放地址」下命中：返回该 host 的规则表（空数组也返回，与上游 break 语义一致）
-    return r.regex.filter((s) => typeof s === 'string' && s.length > 0);
+    const hosts = Array.isArray(r?.hosts)
+      ? r.hosts.map((h) => String(h || '').trim()).filter(Boolean)
+      : (typeof r?.host === 'string' && r.host.trim() ? [r.host.trim()] : []);
+    if (!hosts.length) continue;
+    if (!hosts.some((h) => tsUrlPre.includes(h))) continue;
+    if (Array.isArray(r.regex)) {
+      for (const s of r.regex) if (typeof s === 'string' && s.length > 0) out.push(s);
+    }
+    break; // 上游语义：第一条命中 hosts 的 rule 生效后不再继续
   }
-  return [];
+  // ★ 内置规则兜底（去重）
+  for (const re of BUILTIN_AD_REGEX) if (!out.includes(re)) out.push(re);
+  return out;
 }
 
 /**
