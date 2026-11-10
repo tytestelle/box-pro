@@ -40,7 +40,7 @@ import type {
 } from '../../shared/types';
 import type { EngineHost } from '../../engine/ports';
 import { createPooledSandboxFactory } from '../../engine/js/worker/JsWorkerPool';
-import { userDataDir, cacheDir, resourcesDir, spiderCacheDir, distDir } from '../util/paths';
+import { userDataDir, cacheDir, resourcesDir, spiderCacheDir, distDir, localImportsDir } from '../util/paths';
 import { safeStorageDriveCodec } from '../util/driveCodec';
 import {
   driveBindHintFromPlaySources,
@@ -51,10 +51,11 @@ import {
   wrapPlayUrl,
   wrapPlayUrlWithHeaders,
 } from '../../shared/driveProvider';
-import { join, dirname, basename, relative } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { join, dirname } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { createHash } from 'node:crypto';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync } from 'node:fs';
 import { directPlayUrlError } from '../../shared/playbackResult';
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { JarSpiderBridge, normalizeJarUrl } from '../../engine/spider/JarSpiderBridge';
 import { mergeCloudDriveTokens } from '../../engine/spider/driveExt';
 import {
@@ -250,12 +251,6 @@ export class SpiderHost {
   private lastPrewarmAt = 0;
   private driveBindKeys = new Set<string>();
   private driveBindStore!: JsonStore;
-  /**
-   * ★ 2026-11-10：py 源配置修复的防重入标记。
-   *   repairPySourcePaths() 内部会调 manager.restore，触发 onChange → onUserConfigChange，
-   *   若此时 repairingPyPaths 为 true 则跳过（由构造函数在外层统一应用修复后的配置）。
-   */
-  private repairingPyPaths = false;
   onSearchAllProgress?: (ev: SearchAllProgressEvent) => void;
   torrentPlay?: Pick<TorrentPlay, 'open'>;
   localPkgs?: LocalPkgAccess;
@@ -317,87 +312,12 @@ export class SpiderHost {
     }
     this.manager.setOnChange((snap, kind) => this.onUserConfigChange(snap, kind));
     if (this.manager.load()) {
-      // ★ 2026-11-10：先修复旧配置里指向 resources 的 py api（覆盖安装后文件丢失 → 改指 data/py-sources）
-      this.repairPySourcePaths();
-      // 再应用（修复后的）配置
       this.onUserConfigChange(this.manager.snapshot());
     }
     this.driveBindStore = new JsonStore(join(userDataDir(), 'drive-bind-learned.json'));
     const learned = this.driveBindStore.getObject<unknown>('list', null);
     if (Array.isArray(learned)) {
       for (const k of learned) if (typeof k === 'string' && k) this.driveBindKeys.add(k);
-    }
-  }
-
-  /**
-   * ★ 2026-11-10（用户要求）：py 源配置自愈 —— 旧配置 api 指向 resources 副本，
-   *   覆盖安装替换 resources 后文件丢失。这里扫描所有 py 源：
-   *     · api 指向的文件存在 → 不动；
-   *     · 文件丢失但 data/py-sources 下有同名/同相对路径备份 → 永久改写配置里的 api 指向备份；
-   *     · 都没有 → 记 warning，保持原配置不变（用户重新导入后会自动恢复）。
-   *   改写用 manager.restore 一次性提交（避免逐条 updateSource 触发多次 onChange）。
-   *   restore 触发的 onChange 在本方法内会被 repairingPyPaths 跳过，由构造函数统一应用。
-   */
-  private repairPySourcePaths(): void {
-    if (this.repairingPyPaths) return;
-    this.repairingPyPaths = true;
-    let changed = false;
-    try {
-      const snap = this.manager.snapshot();
-      const pyRoot = join(userDataDir(), 'py-sources');
-      let resRoot = '';
-      try { resRoot = resourcesDir(); } catch { /* ignore */ }
-
-      const newSources = snap.sources.map((s) => {
-        const api = (s.api || '').trim();
-        if (!/\.py(?:[?#;]|$)/i.test(api)) return s;
-
-        const [rawPath, ...rest] = api.split(';');
-        const suffix = rest.length ? ';' + rest.join(';') : '';
-
-        let filePath = '';
-        let isFileUrl = false;
-        try {
-          if (/^file:\/\//i.test(rawPath)) {
-            isFileUrl = true;
-            filePath = fileURLToPath(rawPath);
-          } else if (/^[A-Za-z]:[/\\]/.test(rawPath) || rawPath.startsWith('/')) {
-            filePath = rawPath;
-          } else {
-            return s; // 相对路径 / 网络 URL：不处理
-          }
-        } catch {
-          return s;
-        }
-
-        if (existsSync(filePath)) return s; // 原文件在，不动
-
-        // 原文件丢失：在 data/py-sources 里按相对路径 / basename 找备份
-        let rel = '';
-        if (resRoot) {
-          try { rel = relative(resRoot, filePath); } catch { rel = ''; }
-        }
-        const candidates: string[] = [];
-        if (rel && !rel.startsWith('..')) candidates.push(join(pyRoot, rel));
-        candidates.push(join(pyRoot, basename(filePath)));
-        const hit = candidates.find((p) => existsSync(p));
-        if (!hit) {
-          this.logger.w(`py 源缺失且无备份：${s.key} | ${filePath}`);
-          return s;
-        }
-        const newApi = (isFileUrl ? pathToFileURL(hit).toString() : hit) + suffix;
-        this.logger.i(`py 源配置已修复：${s.key} | ${filePath} → ${hit}`);
-        changed = true;
-        return { ...s, api: newApi };
-      });
-
-      if (changed) {
-        this.manager.restore({ ...snap, sources: newSources });
-      }
-    } catch (e) {
-      this.logger.w(`py 源配置修复失败：${(e as Error).message}`);
-    } finally {
-      this.repairingPyPaths = false;
     }
   }
 
@@ -477,6 +397,177 @@ export class SpiderHost {
 
   cfgUpdateSource(key: string, patch: SourceUpdatePatch): SourceBean {
     return this.manager.updateSource(key, patch);
+  }
+
+  /**
+   * ★ 2026-11-10（用户要求）：从网络 URL 导入 .py 源。
+   *   下载 → 校验（非空、非 HTML、像 Python）→ 写入 imports/py/net-<sha1>/<filename>.py + _meta.json
+   *   → 构造 SourceBean 加入配置。
+   *   _meta.json 记录 url + sha256，启动时由 checkPyUpdates() 联网比对，内容变化则重新下载。
+   *   文件落在 imports 下，覆盖安装由 build/installer.nsh 保留（与本地 .py 导入同一目录）。
+   *   单文件导入：不处理 py 内部引用的其它文件（与本地单文件导入语义一致）。
+   */
+  async importPyFromUrl(url: string, name?: string): Promise<{ key: string; file: string }> {
+    const u = (url || '').trim();
+    if (!/^https?:\/\//i.test(u)) throw new Error('请填写 http(s):// 开头的 .py 文件地址');
+
+    // 1) 下载
+    let body: Buffer;
+    try {
+      const res = await this.http.request({ url: u, method: 'get', timeoutMs: 30_000 });
+      const raw = res.content;
+      body = Buffer.isBuffer(raw)
+        ? raw
+        : Buffer.from(typeof raw === 'string' ? raw : String(raw ?? ''), 'utf-8');
+    } catch (e) {
+      throw new Error(`下载失败：${(e as Error).message}`);
+    }
+    if (!body.length) throw new Error('下载内容为空');
+    if (body.length > 8 * 1024 * 1024) throw new Error('文件过大（>8MB），不像普通 .py 源');
+
+    // 2) 内容校验（HTML 错误页 / 非 Python）
+    const text = body.toString('utf-8');
+    const head = text.slice(0, 512).trim().toLowerCase();
+    if (head.startsWith('<!doctype') || head.startsWith('<html') || head.includes('<head>')) {
+      throw new Error('下载内容是 HTML 页面（可能是错误页/登录页），不是 .py 文件');
+    }
+    if (!/\b(def|class|import|from)\s/.test(text)) {
+      throw new Error('下载内容不像 Python 源码（缺少 def / class / import / from）');
+    }
+
+    // 3) 文件名：取 URL 最后一段，必须是安全的 xxx.py；否则用 source.py
+    let base = 'source.py';
+    try {
+      const p = new URL(u).pathname;
+      const last = decodeURIComponent(p.split('/').filter(Boolean).pop() || '');
+      if (last && /\.py$/i.test(last) && !last.includes('..') && !last.includes('/') && !last.includes('\\')) {
+        base = last;
+      }
+    } catch {
+      /* 保留 source.py */
+    }
+
+    // 4) 目录 + 文件（与本地 .py 导入同一 imports/py/<key>/ 结构）
+    const sha1 = createHash('sha1').update(u).digest('hex').slice(0, 12);
+    const key = `net-${sha1}`;
+    const dir = join(localImportsDir(), 'py', key);
+    const file = join(dir, base);
+    try {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(file, body);
+    } catch (e) {
+      throw new Error(`写入失败：${(e as Error).message}`);
+    }
+
+    // 5) _meta.json（url + sha256 + name + 时间戳），供 checkPyUpdates 比对
+    const sha256 = createHash('sha256').update(body).digest('hex');
+    try {
+      writeFileSync(
+        join(dir, '_meta.json'),
+        JSON.stringify({
+          url: u,
+          sha256,
+          name: (name || '').trim() || base.replace(/\.py$/i, ''),
+          importedAt: Date.now(),
+          lastCheckedAt: 0,
+          updatedAt: 0,
+        }, null, 2),
+        'utf-8',
+      );
+    } catch (e) {
+      this.logger.w(`网络 py _meta.json 写入失败：${(e as Error).message}`);
+    }
+
+    // 6) 构造 SourceBean（type=3 + api 以 .py 结尾，与本地导入一致）
+    const displayName = (name || '').trim() || base.replace(/\.py$/i, '') || key;
+    const bean: SourceBean = {
+      key,
+      name: displayName,
+      type: 3,
+      api: pathToFileURL(file).toString(),
+      jar: '',
+      ext: '',
+      playUrl: '',
+      timeout: 15,
+      searchable: 1,
+      quickSearch: 1,
+      changeable: 1,
+      filterable: 1,
+    } as SourceBean;
+    this.cfgAddSource(bean);
+    this.logger.i(`网络 py 源已导入：${u} → ${file}（key=${key}）`);
+    return { key, file };
+  }
+
+  /**
+   * ★ 2026-11-10（用户要求）：联网检查网络 py 源是否有更新。
+   *   遍历 imports/py/ 下所有含 _meta.json 的子目录：
+   *     GET 原 url → 计算 sha256 → 与 _meta.sha256 不同 → 覆盖文件、更新 _meta；
+   *     相同 → 只更新 lastCheckedAt；失败 → 记 warning，不影响其它源。
+   *   启动后由 src/main/index.ts 延迟调用一次；后续可挂按钮/定时器按需调用。
+   */
+  async checkPyUpdates(): Promise<{ updated: number; checked: number; failed: number }> {
+    const pyRoot = join(localImportsDir(), 'py');
+    if (!existsSync(pyRoot)) return { updated: 0, checked: 0, failed: 0 };
+
+    let dirs: string[] = [];
+    try { dirs = readdirSync(pyRoot); } catch { return { updated: 0, checked: 0, failed: 0 }; }
+
+    let updated = 0;
+    let checked = 0;
+    let failed = 0;
+
+    for (const key of dirs) {
+      const dir = join(pyRoot, key);
+      let st: ReturnType<typeof statSync>;
+      try { st = statSync(dir); } catch { continue; }
+      if (!st.isDirectory()) continue;
+
+      const metaPath = join(dir, '_meta.json');
+      if (!existsSync(metaPath)) continue;
+      let meta: { url?: string; sha256?: string; name?: string; importedAt?: number; lastCheckedAt?: number; updatedAt?: number };
+      try { meta = JSON.parse(readFileSync(metaPath, 'utf-8')); } catch { continue; }
+      if (!meta?.url || typeof meta.url !== 'string') continue;
+
+      checked++;
+      try {
+        const res = await this.http.request({ url: meta.url, method: 'get', timeoutMs: 30_000 });
+        const raw = res.content;
+        const body = Buffer.isBuffer(raw)
+          ? raw
+          : Buffer.from(typeof raw === 'string' ? raw : String(raw ?? ''), 'utf-8');
+        if (!body.length) throw new Error('空响应');
+
+        const sha256 = createHash('sha256').update(body).digest('hex');
+        if (sha256 !== meta.sha256) {
+          // 内容变化：保留原文件名（扫描目录内第一个 .py），覆盖写入
+          let base = 'source.py';
+          try {
+            const files = readdirSync(dir).filter((f) => f.toLowerCase().endsWith('.py'));
+            if (files[0]) base = files[0];
+          } catch { /* 保留默认 */ }
+          const file = join(dir, base);
+          writeFileSync(file, body);
+          meta.sha256 = sha256;
+          meta.lastCheckedAt = Date.now();
+          meta.updatedAt = Date.now();
+          writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf-8');
+          updated++;
+          this.logger.i(`网络 py 已更新：${meta.url} → ${file}`);
+        } else {
+          meta.lastCheckedAt = Date.now();
+          writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf-8');
+        }
+      } catch (e) {
+        failed++;
+        this.logger.w(`网络 py 检查更新失败：${meta.url} — ${(e as Error).message}`);
+      }
+    }
+
+    if (checked > 0) {
+      this.logger.i(`网络 py 更新检查完成：检查 ${checked}，更新 ${updated}，失败 ${failed}`);
+    }
+    return { updated, checked, failed };
   }
 
   cfgDeleteSource(key: string): void {
@@ -2447,60 +2538,9 @@ export class SpiderHost {
     return mgr.refreshEpg();
   }
 
-  /**
-   * ★ 2026-11-10（用户要求）：py 源运行时兜底 —— 万一 repairPySourcePaths 没修到（例如
-   *   启动后用户手动删了 resources 下的文件），applyConfig 时再检查一次：
-   *   api 指向的资源文件不存在时，回退到 data/py-sources 下的同名/同相对路径文件。
-   *   注意：这里只改内存里的 SourceBean，不写回配置；永久修复由 repairPySourcePaths 负责。
-   */
-  private resolvePySourcePath(src: SourceBean): SourceBean {
-    const api = (src.api || '').trim();
-    if (!/\.py(?:[?#;]|$)/i.test(api)) return src;
-
-    const [rawPath, ...restParams] = api.split(';');
-    const paramSuffix = restParams.length ? ';' + restParams.join(';') : '';
-
-    let filePath = '';
-    let isFileUrl = false;
-    try {
-      if (/^file:\/\//i.test(rawPath)) {
-        isFileUrl = true;
-        filePath = fileURLToPath(rawPath);
-      } else if (/^[A-Za-z]:[/\\]/.test(rawPath) || rawPath.startsWith('/')) {
-        filePath = rawPath;
-      } else {
-        return src; // HTTP 或相对路径，不处理
-      }
-    } catch {
-      return src;
-    }
-
-    if (existsSync(filePath)) return src;
-
-    let rel = '';
-    try {
-      const resRoot = resourcesDir();
-      if (resRoot) rel = relative(resRoot, filePath);
-    } catch { /* ignore */ }
-    if (!rel || rel.startsWith('..')) rel = basename(filePath);
-
-    const pyRoot = join(userDataDir(), 'py-sources');
-    const candidates = [join(pyRoot, rel), join(pyRoot, basename(filePath))];
-    for (const cand of candidates) {
-      if (existsSync(cand)) {
-        const newPath = isFileUrl ? pathToFileURL(cand).toString() : cand;
-        const newApi = newPath + paramSuffix;
-        this.logger.i(`py 源回退（运行时）：${src.key} | ${filePath} → ${cand}`);
-        return { ...src, api: newApi };
-      }
-    }
-    return src;
-  }
-
   private applyConfig(cfg: SiteConfig): void {
     this.sourceMap.clear();
-    // ★ 2026-11-10：py 源运行时兜底（resources 缺失时改指 data/py-sources，仅本次内存）
-    for (const s of cfg.sites) this.sourceMap.set(s.key, this.resolvePySourcePath(s));
+    for (const s of cfg.sites) this.sourceMap.set(s.key, s);
     this.setSpiderJar(cfg.spider);
   }
 
@@ -2515,8 +2555,6 @@ export class SpiderHost {
 
   private onUserConfigChange(snap: UserConfig, kind: ConfigChangeKind = 'content'): void {
     if (kind === 'ui') return;
-    // ★ 2026-11-10：repairPySourcePaths 内部 restore 会触发本方法，跳过，由构造函数统一应用
-    if (this.repairingPyPaths) return;
     // ★ 2026-10-14：直播源列表可能变了（新增/删除/重排）→ 清缓存，避免展示旧源的频道
     this.invalidateLiveCache();
     const base = snap.apiUrl || '';
