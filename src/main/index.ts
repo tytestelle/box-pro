@@ -128,6 +128,8 @@ const proxy = new LocalProxyServer(
   {
     enabled: () => playerSettings.settings.m3u8Purify,
     rulesFor: (url) => hostRegexFor(url, host.siteConfig?.rules),
+    // ★ 2026-11-10：订阅 `ads` 域名黑名单（`LocalProxyServer.playProxy` 里命中即 204）
+    adsFor: () => host.siteConfig?.ads || [],
   },
   // ★ 2026-09-29 WebDAV 取流认证（凭据只在主进程加密存储里）
   (id) => dav.authHeader(id),
