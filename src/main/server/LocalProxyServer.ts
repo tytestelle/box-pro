@@ -20,7 +20,7 @@ import { logPlayDiag, redactUrl } from '../util/playDiag';
 import { createDohAgent } from '../net/DnsResolver';
 import { dispatchChain } from '../net/proxy';
 import { mergeSetCookies, setCookieList, cookiePairOf } from '../net/cookieMerge';
-import { purifyVodM3u8 } from '../../engine/util/m3u8Purify';
+import { purifyVodM3u8, isAdKeywordUrl } from '../../engine/util/m3u8Purify';
 import { parseBtRoute } from '../../engine/torrent/magnet';
 import { resolvePkgFile } from '../../engine/config/localPkg';
 import { HtmlMedia } from '../player/HtmlMedia';
@@ -106,10 +106,16 @@ export class LocalProxyServer {
     /**
      * ★ 2026-09-29：m3u8 去广告注入（对位 TVBox `HawkConfig.M3U8_PURIFY`，默认关）。
      *   · `enabled()` —— 配置页开关（<userData>/player-settings.json），每轮清单回源时读一次 → 改后即时生效；
-     *   · `rulesFor(url)` —— 该播放地址所属 host 的订阅 `rules[].regex`（`hostRegexFor` 的产物）。
+     *   · `rulesFor(url)` —— 该播放地址所属 host 的订阅 `rules[].regex`（`hostRegexFor` 的产物）；
+     *   · `adsFor()` —— ★ 2026-11-10：订阅 `ads` 域名黑名单（命中即 204 拦截，始终生效）。
      *   不注入 = 彻底不做去广告（旧行为）。
      */
-    private purify?: { enabled: () => boolean; rulesFor: (url: string) => string[] },
+    private purify?: {
+      enabled: () => boolean;
+      rulesFor: (url: string) => string[];
+      /** ★ 2026-11-10：TVBox 订阅 `ads` 域名黑名单（命中即 204 拦截） */
+      adsFor?: () => string[];
+    },
     /**
      * ★ 2026-09-29 WebDAV 取流认证：`/play?...&dav=<serverId>` → 该服务器的 `Authorization` 头值。
      *   凭据只存在主进程加密存储里，**绝不进 URL**；不注入 = 不做 WebDAV 认证（旧行为）。
@@ -651,6 +657,27 @@ private imgProxy(u: URL, res: ServerResponse): void {
       res.writeHead(400);
       res.end('missing url'); return;
     }
+
+    // ★ 2026-11-10：广告拦截（三重，命中即 204 空响应 → 播放器跳过该请求）
+    //   ① 订阅 `ads` 域名黑名单 —— 命中直接拦截（始终生效，不依赖 m3u8 去广告开关）；
+    //   ② 软件内置强关键词（赌场/娱乐城/博彩/casino/gambling/bet365）—— URL 的 path segment
+    //      或 hostname label **完整命中**即拦截（避免误伤 casino-xxx 这类片段）。
+    if (this.purify?.adsFor) {
+      const ads = this.purify.adsFor();
+      if (ads.some((d) => d && target.includes(d))) {
+        this.logger.i(`proxy /play: 命中订阅广告域名黑名单，拦截 ${redactUrl(target)}`);
+        res.writeHead(204, { 'Access-Control-Allow-Origin': '*' });
+        res.end();
+        return;
+      }
+    }
+    if (isAdKeywordUrl(target)) {
+      this.logger.i(`proxy /play: 命中内置广告关键词，拦截 ${redactUrl(target)}`);
+      res.writeHead(204, { 'Access-Control-Allow-Origin': '*' });
+      res.end();
+      return;
+    }
+
     const headers: Record<string, string> = {};
     Object.assign(headers, relayHeaders);
     if (ua) headers['User-Agent'] = ua;
