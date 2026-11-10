@@ -105,6 +105,11 @@ declare global {
         gotoDriveBind: () => Promise<IpcResult<void>>;
         onNavDriveBind: (cb: () => void) => () => void;
       };
+      // ★ 2026-11-10（用户要求）：广告关键词读写（配置页「m3u8 去广告 · 规则」按钮）
+      adKeywords: {
+        get: () => Promise<IpcResult<{ strong: string[]; weak: string[] }>>;
+        set: (patch: Partial<{ strong: string[]; weak: string[] }>) => Promise<IpcResult<{ strong: string[]; weak: string[] }>>;
+      };
       vod: {
         home: (key: string) => Promise<IpcResult<HomeResult>>;
         category: (a: { key: string; tid: string; pg: string; extend?: Record<string, string> }) => Promise<IpcResult<HomeResult>>;
@@ -331,6 +336,9 @@ export const client = {
   // ★ 播放网盘资源未绑定 cookie → 让主窗口跳到「点播页」（源主页有「网盘绑定」入口；播放器窗口也走此路径）
   gotoDriveBind: () => unwrap(window.api.config.gotoDriveBind()),
   onNavDriveBind: (cb: () => void) => window.api.config.onNavDriveBind(cb),
+  /** ★ 2026-11-10（用户要求）：广告关键词读写（配置页「m3u8 去广告 · 规则」按钮） */
+  adKeywordsGet: () => unwrap(window.api.adKeywords.get()),
+  adKeywordsSet: (patch: Partial<{ strong: string[]; weak: string[] }>) => unwrap(window.api.adKeywords.set(patch)),
   winMinimize: () => unwrap(window.api.win.minimize()),
   winMaximize: () => unwrap(window.api.win.maximize()),
   winClose: () => unwrap(window.api.win.close()),
