@@ -76,7 +76,13 @@ export default function PlayerPage() {
   const initSeqRef = useRef(0);
 
   // 解析并播放指定集
-  const resolve = useCallback(async (d: PlayerInitData, idx: number, preparedUrl = '') => {
+  /**
+   * ★ 2026-11-10（修复「全屏播完当前集自动连播下一集时退出全屏」）：
+   *   新增 `keepPlayer` 参数。换集/重试时传 true → **不清空 activeUrl**，
+   *   <VideoPlayer> 保持挂载，只靠 url prop 切换视频源，全屏 DOM 不被移除，
+   *   全屏状态自然保持；否则 setActiveUrl('') 会卸载播放器、浏览器强制退出全屏。
+   */
+  const resolve = useCallback(async (d: PlayerInitData, idx: number, preparedUrl = '', keepPlayer = false) => {
     const eps = d.episodes;
     if (!eps || idx < 0 || idx >= eps.length) return;
     const target = eps[idx];
@@ -90,7 +96,8 @@ export default function PlayerPage() {
     setCurName(display);
     setResolution('');
     setResolving(true);
-    setActiveUrl('');
+    // ★ 2026-11-10：换集/重试时保留当前播放器实例（否则卸载会丢全屏）
+    if (!keepPlayer) setActiveUrl('');
     setParseMsg('');
     setDriveBind(null);
     try {
@@ -189,7 +196,8 @@ export default function PlayerPage() {
         // 保持初始化上下文与显示状态一致；后续重试/主窗口复用不能回到旧集。
         next.epIndex = idx;
         setInit(next);
-        void resolve(next, idx);
+        // ★ 2026-11-10：keepPlayer=true → 不卸载播放器，全屏保持
+        void resolve(next, idx, '', true);
       }
     },
     [init, resolve],
@@ -234,7 +242,8 @@ export default function PlayerPage() {
         const next = { ...init, startTime: 0, lastUrl: '' };
         next.epIndex = idx;
         setInit(next);
-        void resolve(next, idx);
+        // ★ 2026-11-10：keepPlayer=true → 自动连播/手动上一集下一集均不卸载播放器，全屏保持
+        void resolve(next, idx, '', true);
       }
     },
     [init, resolve],
@@ -371,7 +380,8 @@ export default function PlayerPage() {
             onClose={() => setDriveBind(null)}
             onSaved={() => {
               setDriveBind(null);
-              if (init) void resolve(init, epIndex);
+              // ★ 2026-11-10：绑定成功后重解析当前集，keepPlayer=true 保持全屏
+              if (init) void resolve(init, epIndex, '', true);
             }}
           />
         )}
@@ -389,9 +399,10 @@ export default function PlayerPage() {
               danmakuTitle={((init?.subtitleTitle || init?.title) || '').trim()}
               driveBindProvider={driveBind}
               // ★ 2026-09-29：在播放器里绑定网盘成功后自动重新解析当前集（不必手动重开播放窗口）
+              // ★ 2026-11-10：keepPlayer=true 保持全屏
               onDriveBound={() => {
                 setDriveBind(null);
-                if (init) void resolve(init, epIndex);
+                if (init) void resolve(init, epIndex, '', true);
               }}
               // ★ 历史续播：进度以历史记录为准（新直链与 playTime 旧键不匹配，须显式传入）
               startTime={init?.startTime || 0}
@@ -420,7 +431,8 @@ export default function PlayerPage() {
              <div className="empty">{resolving ? '正在解析本集…' : parseMsg ? '播放失败，可重试或切换集数' : '等待播放…'}
                {!resolving && init && <div style={{ marginTop: 12, display: 'flex', gap: 12, justifyContent: 'center' }}>
                  <button disabled={!canPrev} onClick={() => goEp(epIndex - 1)}>上一集</button>
-                 <button onClick={() => void resolve(init, epIndex)}>重试</button>
+                 {/* ★ 2026-11-10：重试也 keepPlayer=true */}
+                 <button onClick={() => void resolve(init, epIndex, '', true)}>重试</button>
                  <button disabled={!canNext} onClick={() => goEp(epIndex + 1)}>下一集</button>
                </div>}
              </div>
