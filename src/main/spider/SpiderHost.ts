@@ -447,7 +447,6 @@ export class SpiderHost {
           const res = await undiciRequest(current, {
             method: 'GET',
             headers,
-            maxRedirections: 0,
             headersTimeout: 30_000,
             bodyTimeout: 30_000,
             dispatcher,
