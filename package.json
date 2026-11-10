@@ -85,7 +85,8 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "license": "LICENSE.txt",
-      "artifactName": "${productName} Setup ${version}.${ext}"
+      "artifactName": "${productName} Setup ${version}.${ext}",
+      "include": "build/installer.nsh"
     }
   }
 }
