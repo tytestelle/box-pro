@@ -4,8 +4,8 @@
 //   必须早于 logger / 各 Store 的模块求值，否则它们会把路径解析到旧位置。
 import { dataDirReport } from './util/dataDirBootstrap';
 import { app, BrowserWindow, nativeTheme, shell } from 'electron';
-import { join } from 'node:path';
-import { existsSync } from 'node:fs';
+import { join, dirname, relative } from 'node:path';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, statSync } from 'node:fs';
 import { registerIpc } from './ipc';
 import { SpiderHost } from './spider/SpiderHost';
 import { LocalProxyServer } from './server/LocalProxyServer';
@@ -23,7 +23,7 @@ import { DavStore } from './store/DavStore';
 import { JsonStore } from './store/JsonStore';
 import { LocalPkgStore } from './store/LocalPkgStore';
 import { LOCAL_PROXY_BASE } from '../shared/constants';
-import { localImportsDir, userDataDir } from './util/paths';
+import { localImportsDir, resourcesDir, userDataDir } from './util/paths';
 import { safeStorageDriveCodec } from './util/driveCodec';
 // ★ 2026-10-13：订阅源相关（IPC 注册 + 本地导入函数注入 + 启动自动检查更新）
 import {
@@ -155,6 +155,52 @@ function isDev(): boolean {
   return !app.isPackaged && process.env.NODE_ENV !== 'production';
 }
 
+/**
+ * ★ 2026-11-10（用户要求）：py 源文件迁移 —— 覆盖安装替换 resources，data 目录保留。
+ *   启动时把 resources 下的所有 .py 复制到 data/py-sources/（保持相对路径，已存在则跳过），
+ *   之后加载器在 resources 缺失时自动回退到 data/py-sources。
+ */
+function migratePySourcesToUserData(): void {
+  let resRoot: string;
+  let pyRoot: string;
+  try {
+    resRoot = resourcesDir();
+    pyRoot = join(userDataDir(), 'py-sources');
+  } catch {
+    return;
+  }
+  if (!resRoot || !existsSync(resRoot)) return;
+  try { mkdirSync(pyRoot, { recursive: true }); } catch { return; }
+
+  const walk = (dir: string, cb: (file: string, rel: string) => void): void => {
+    let names: string[];
+    try { names = readdirSync(dir); } catch { return; }
+    for (const name of names) {
+      const full = join(dir, name);
+      let st: ReturnType<typeof statSync>;
+      try { st = statSync(full); } catch { continue; }
+      if (st.isDirectory()) walk(full, cb);
+      else if (name.toLowerCase().endsWith('.py')) cb(full, relative(resRoot, full));
+    }
+  };
+
+  let migrated = 0;
+  walk(resRoot, (file, rel) => {
+    const dest = join(pyRoot, rel);
+    if (existsSync(dest)) return; // 已有 → 不覆盖（保护用户改动）
+    try {
+      mkdirSync(dirname(dest), { recursive: true });
+      copyFileSync(file, dest);
+      migrated++;
+    } catch (e) {
+      fileLogger.w(`py 迁移失败 ${rel}：${(e as Error).message}`);
+    }
+  });
+  if (migrated > 0) {
+    fileLogger.i(`py 迁移：已将 ${migrated} 个 .py 从 resources 复制到 ${pyRoot}`);
+  }
+}
+
 // 渲染策略：**不再强制禁用 GPU/硬件加速**。
 //   过往为"无 GPU/驱动异常环境"加了 disableHardwareAcceleration + disable-gpu + disable-software-rasterizer，
 //   但用户实测（本机有正常 GPU）强禁后无边框窗口在最大化/resize 时合成器不刷新，
@@ -253,6 +299,13 @@ app.whenReady().then(async () => {
     }
   } catch {
     /* ignore */
+  }
+
+  // ★ 2026-11-10：py 源文件迁移 —— resources 下所有 .py 复制到 data/py-sources（覆盖安装不丢）
+  try {
+    migratePySourcesToUserData();
+  } catch (e) {
+    fileLogger.w('py 源迁移异常：' + (e as Error).message);
   }
 
   // 启动即记录资源根定位结果：打包后（尤其 portable 的 7z-out 解压布局）
