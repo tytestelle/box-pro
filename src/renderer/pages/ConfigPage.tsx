@@ -1,3 +1,4 @@
+// src/renderer/pages/ConfigPage.tsx — 配置页（订阅与源 / 源健康 / 配置档案 / 凭据 / 存储 / 外观 / 播放 / 快捷键 / 网络 / 备份）
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { client } from '../api/client';
 import type { ImportReturn } from '../api/client';
@@ -19,6 +20,8 @@ import LiveSubscriptionPanel from '../components/LiveSubscriptionPanel';
 import LiveImportModal from '../components/LiveImportModal';
 // ★ 2026-11-10（用户要求）：.py 源导入弹窗（本地文件 / 网络地址）
 import PyImportModal, { type PyImportResult } from '../components/PyImportModal';
+// ★ 2026-11-10（用户要求）：广告关键词编辑器（配置页「播放 · m3u8 去广告 · 规则」按钮）
+import AdKeywordModal from '../components/AdKeywordModal';
 
 type TabId = 'sources' | 'livesub' | 'health' | 'profiles' | 'account' | 'storage' | 'appearance' | 'play' | 'shortcut' | 'network' | 'backup';
 
@@ -84,11 +87,12 @@ export default function ConfigPage() {
   const [liveImportOpen, setLiveImportOpen] = useState(false);
   // ★ 2026-11-10（用户要求）：.py 源导入弹窗开关（本地 / 网络）
   const [pyImportOpen, setPyImportOpen] = useState(false);
+  // ★ 2026-11-10（用户要求）：广告关键词编辑器开关（配置页「播放 · m3u8 去广告」）
+  const [adKeywordOpen, setAdKeywordOpen] = useState(false);
   // 外观主题
   const [theme, setTheme] = useState<Theme>(() => currentTheme());
   /** ★ 2026-09-30（用户要求）：是否展示「发现」页（默认展示；关掉后导航与默认落地页相应变化） */
   const [showDiscover, setShowDiscoverState] = useState<boolean>(() => getShowDiscover());
-  /** ★ 2026-10-08（用户要求）：详情页是否单独窗口展示（默认关；切换即时生效，见 lib/detailWin.ts） */
   /** ★ 2026-10-08：界面动效三态（跟随系统 / 始终开启 / 关闭）—— 本机系统「动画效果」为关时也能强制开启动效 */
   const [motion, setMotionState] = useState<MotionPref>(() => getMotionPref());
   // 外挂字幕（多源：SubtitleCat 免 token / assrt 需 token）
@@ -807,8 +811,6 @@ export default function ConfigPage() {
   // ---- 选项卡（替代原 <a href="#cfg-*"> 锚点跳转，避免 HashRouter 下触发路由跳到空页）----
   const TABS: { id: TabId; label: string }[] = [
     { id: 'sources', label: '订阅与源' },
-    // ★ 2026-10-13（用户要求）：直播订阅源管理从直播页搬到配置页，独立 tab
-  //  { id: 'livesub', label: '直播订阅源' },
     { id: 'health', label: '源健康与维护' },
     { id: 'profiles', label: '配置档案' },
     { id: 'account', label: '凭据' },
@@ -849,6 +851,7 @@ export default function ConfigPage() {
     return <span style={{ color: 'var(--warn)' }} title={avail.hint}>{avail.hint ?? '不可用'}</span>;
   };
 
+  // ─── 以下是 JSX 渲染部分（第二段）───
   return (
     <div className="content cfg-content">
       <div style={{ display: 'flex', gap: 4, marginBottom: 16, borderBottom: '1px solid var(--border)', flexWrap: 'wrap' }}>
@@ -872,11 +875,9 @@ export default function ConfigPage() {
         ))}
       </div>
 
-      
       {/* ===== 一、订阅与源 ===== */}
       {tab === 'sources' && (
       <>
-      
 {/* 1) 导入区 */}
       <div className="card" id="cfg-import" style={{ padding: 12, marginBottom: 16 }}>
         <div className="row" style={{ marginBottom: 10 }}>
@@ -1187,12 +1188,9 @@ export default function ConfigPage() {
           )}
         </div>
       )}
-
-      
       </>
       )}
 
-      
       {/* ===== 一·B、直播订阅源（★ 2026-10-13 从 LivePage 搬到配置页） ===== */}
       {tab === 'livesub' && (
       <div className="card" style={{ padding: 16, marginBottom: 16 }}>
@@ -1203,7 +1201,6 @@ export default function ConfigPage() {
       {/* ===== 二、源健康与维护 ===== */}
       {tab === 'health' && (
       <>
-      
 {/* 0.5) 逐源体检（主页可见性审计） */}
       <div className="card" id="cfg-audit" style={{ padding: 12, marginBottom: 16 }}>
         <div className="row" style={{ marginBottom: 8, flexWrap: 'wrap' }}>
@@ -1314,16 +1311,12 @@ export default function ConfigPage() {
           </div>
         )}
       </div>
-
-      
-      {/* ===== 三、配置档案 ===== */}
       </>
       )}
 
       {/* ===== 三、配置档案 ===== */}
       {tab === 'profiles' && (
       <>
-      
 {/* 0) 多配置档案（多 JSON 源切换） */}
       <div className="card" id="cfg-profiles" style={{ padding: 12, marginBottom: 16 }}>
         <details open={false}>
@@ -1418,16 +1411,12 @@ export default function ConfigPage() {
           </div>
         )}
       </div>
-
-      
-      {/* ===== 四、凭据 ===== */}
       </>
       )}
 
       {/* ===== 四、凭据 ===== */}
       {tab === 'account' && (
       <>
-      
       {/* 网盘 Cookie 统一在「源内绑定」（点播页 → 网盘类源 → 源主页「网盘绑定」按钮） */}
 
       {/* 外挂字幕：多字幕源（SubtitleCat 免 token / assrt 需 token） */}
@@ -1515,15 +1504,12 @@ export default function ConfigPage() {
           {metaMsg?.text}
         </div>
       </div>
-
-      {/* ===== 五、外观 ===== */}
       </>
       )}
 
       {/* ===== 五、外观 ===== */}
       {tab === 'appearance' && (
       <>
-      
 {/* 外观：亮/深色模式（Mica 表层随主题切换） */}
       <div className="card" id="cfg-appearance" style={{ padding: 12, marginBottom: 16 }}>
         <div className="row" style={{ marginBottom: 8 }}>
@@ -1545,9 +1531,7 @@ export default function ConfigPage() {
         </div>
       </div>
 
-      {/* ★ 2026-10-08（用户要求「整体重做界面视觉与动效交互」）：界面动效三态。
-          默认跟随系统；若系统关了「动画效果」（Windows 设置 → 辅助功能 → 视觉效果），
-          系统偏好会让浏览器折叠一切动画 —— 这里可强制开启。 */}
+      {/* ★ 2026-10-08（用户要求「整体重做界面视觉与动效交互」）：界面动效三态。 */}
       <div className="card" id="cfg-motion" style={{ padding: 12, marginBottom: 16 }}>
         <div className="row" style={{ marginBottom: 8 }}>
           <span className="muted" style={{ fontWeight: 600 }}>界面动效</span>
@@ -1568,7 +1552,7 @@ export default function ConfigPage() {
         </div>
       </div>
 
-      {/* ★ 2026-09-30（用户要求）：发现页展示开关（默认展示；关掉后侧边栏/顶栏不再出现「发现」，落地页改「点播」） */}
+      {/* ★ 2026-09-30（用户要求）：发现页展示开关 */}
       <div className="card" id="cfg-show-discover" style={{ padding: 12, marginBottom: 16 }}>
         <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
           <input
@@ -1586,27 +1570,37 @@ export default function ConfigPage() {
           关闭后导航里不再出现「发现」，打开软件直接进「点播」（源主页）。默认开启。
         </div>
       </div>
-
       </>
       )}
 
       {/* ===== 六、播放（去广告） ===== */}
       {tab === 'play' && (
       <>
-      
       <div className="card" id="cfg-m3u8-purify" style={{ padding: 12, marginBottom: 16 }}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-          <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
-            <input
-              type="checkbox"
-              checked={playPrefs.m3u8Purify}
-              onChange={(e) => void toggleM3u8Purify(e.target.checked)}
-            />
-            <span style={{ fontWeight: 600 }}>m3u8 去广告</span>
-          </label>
+          <div className="row" style={{ alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={playPrefs.m3u8Purify}
+                onChange={(e) => void toggleM3u8Purify(e.target.checked)}
+              />
+              <span style={{ fontWeight: 600 }}>m3u8 去广告</span>
+            </label>
+            {/* ★ 2026-11-10（用户要求）：规则按钮 —— 打开广告关键词编辑器（增删改内置关键词） */}
+            <button
+              onClick={() => setAdKeywordOpen(true)}
+              title="编辑广告关键词（赌场/娱乐城/博彩/casino/…）"
+              style={{ marginLeft: 'auto' }}
+            >
+              ⚙ 规则
+            </button>
+          </div>
           <span className="muted" style={{ fontSize: 11 }}>
             点播清单播放前自动删掉广告分段（切片路径/域名、订阅规则、SCTE-35、切片时长特征）。
             启发式清洗，默认关闭；仅对点播生效，删到段才替换清单。
+            <br />
+            <b>URL 级广告拦截（内置关键词 + 订阅 ads 域名黑名单）始终生效，不受此开关影响。</b>
           </span>
           {playMsg && (
             <span className={playMsg.kind === 'err' ? 'err' : 'status'} style={{ margin: 0 }}>
@@ -1649,7 +1643,6 @@ export default function ConfigPage() {
         </div>
       </div>
       {/* ★ 2026-09-30（用户要求）：点播外部播放器 —— 与磁力分开绑定 */}
-      {/* ★ 2026-10-08（用户要求）：改为**勾选项**总开关 —— 不勾选时即使填了路径也用内置播放器 */}
       <div className="card" id="cfg-vod-player" style={{ padding: 12, marginBottom: 16 }}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
           <span style={{ fontWeight: 600 }}>点播外部播放器（PotPlayer 等）</span>
@@ -1692,7 +1685,7 @@ export default function ConfigPage() {
           )}
         </div>
       </div>
-      {/* ★ 2026-10-08（用户拍板「内置官方构建」）：MPV 高兼容播放内核 —— 随包内置（安装目录内），4K/HEVC/MKV 兼容更好 */}
+      {/* ★ 2026-10-08（用户拍板「内置官方构建」）：MPV 高兼容播放内核 */}
       <div className="card" id="cfg-mpv-kernel" style={{ padding: 12, marginBottom: 16 }}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
           <span style={{ fontWeight: 600 }}>MPV 播放内核（4K / HEVC / MKV）</span>
@@ -1730,7 +1723,6 @@ export default function ConfigPage() {
       {/* ===== 七、快捷键（老板键） ===== */}
       {tab === 'shortcut' && (
       <>
-      
 {/* 老板键：全局快捷键一键隐藏/恢复（视频自动暂停静音） */}
       <div className="card" id="cfg-shortcut" style={{ padding: 12, marginBottom: 16 }}>
         {bossKey ? (
@@ -1787,14 +1779,12 @@ export default function ConfigPage() {
           <div className="empty"><span className="spinner" aria-hidden="true" />加载中…</div>
         )}
       </div>
-
       </>
       )}
 
       {/* ===== 八、网络（代理） ===== */}
       {tab === 'network' && (
       <>
-      
       <div className="card" style={{ padding: 12, marginBottom: 16 }}>
         {proxy ? (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -1839,7 +1829,6 @@ export default function ConfigPage() {
 
       {tab === 'storage' && (
       <>
-      
       <div className="card" style={{ padding: 12, marginBottom: 16 }}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           <span className="muted" style={{ fontSize: 12 }}>
@@ -1899,7 +1888,6 @@ export default function ConfigPage() {
 
       {tab === 'backup' && (
       <>
-      
       <div className="card" style={{ padding: 12, marginBottom: 16 }}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           <span className="muted" style={{ fontSize: 12 }}>
@@ -1920,10 +1908,7 @@ export default function ConfigPage() {
       </>
       )}
 
-      {/* ★ 2026-10-13（用户要求）：导入直播源弹窗（本地文件 / 网络订阅源 + 管理表格）
-          · 「本地文件」按钮回调 doImportLiveLocal —— 复用它原有的本地 TXT / M3U 导入逻辑
-          · 「网络订阅源」标签内添加后，主进程会通过 live:subscriptions-changed 广播，
-            直播页与弹窗表格均会立即刷新，无需重启 */}
+      {/* ★ 2026-10-13（用户要求）：导入直播源弹窗（本地文件 / 网络订阅源 + 管理表格） */}
       <LiveImportModal
         open={liveImportOpen}
         onClose={() => setLiveImportOpen(false)}
@@ -1936,6 +1921,8 @@ export default function ConfigPage() {
         onImportLocal={doImportPyLocal}
         onImportUrl={doImportPyUrl}
       />
+      {/* ★ 2026-11-10（用户要求）：广告关键词编辑器（配置页「播放 · m3u8 去广告 · ⚙ 规则」） */}
+      <AdKeywordModal open={adKeywordOpen} onClose={() => setAdKeywordOpen(false)} />
     </div>
   );
 }
