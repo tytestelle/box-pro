@@ -49,18 +49,20 @@ const AD_DOMAIN_KEYWORDS = [
 const MAX_FRAME_RATE_AD_BLOCK_SIZE = 12; // M3u8.java:46
 const TIMES_NO_AD = 15; // M3u8.java:106
 
-// ───────────────────────── ★ 2026-11-10：内置广告关键词（用户要求） ─────────────────────────
+// ───────────────────────── ★ 2026-11-10：内置广告关键词（用户可在配置页覆盖） ─────────────────────────
 /**
- * 强关键词：URL path segment / domain label **完整命中**即拦截（误伤风险低）。
+ * 默认强关键词：URL path segment / domain label **完整命中**即拦截（误伤风险低）。
  * 也用于 M3U8 清单清洗。
+ * ★ 2026-11-10：改为可导出常量，用户可通过配置页「m3u8 去广告 · 规则」按钮覆盖
+ *   （实际值由 main/player/adKeywordSettings.ts 持久化并注入）。
  */
-const BUILTIN_AD_KEYWORDS_STRONG: string[] = [
+export const DEFAULT_AD_KEYWORDS_STRONG: string[] = [
   '赌场', '娱乐城', '博彩', 'casino', 'gambling', 'bet365',
 ];
 /**
- * 弱关键词：只在 M3U8 清单清洗里用（需要 EXTINF 上下文判断，避免误伤正片）。
+ * 默认弱关键词：只在 M3U8 清单清洗里用（需要 EXTINF 上下文判断，避免误伤正片）。
  */
-const BUILTIN_AD_KEYWORDS_WEAK: string[] = [
+export const DEFAULT_AD_KEYWORDS_WEAK: string[] = [
   'poker', '葡京', '太阳城', '威尼斯人', '银河娱乐', '网赌',
 ];
 
@@ -69,10 +71,11 @@ const escapeRegex = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$
 /**
  * 构建内置 M3U8 清洗正则：删除「含广告关键词的 EXTINF + URI 行对」。
  * 关键词同时以原文与 URL 编码形式出现（M3U8 里 URL 通常已 percent-encode）。
- * ★ 2026-11-10：关键词去重，避免 `casino` / `gambling` 这类纯 ASCII 词重复出现。
+ * ★ 2026-11-10：关键词去重，避免 `casino` / `gambling` 这类纯 ASCII 词重复出现；
+ *   接受外部传入（配置页可编辑），未传时用默认值。
  */
-function buildBuiltinAdRegex(): string[] {
-  const all = [...BUILTIN_AD_KEYWORDS_STRONG, ...BUILTIN_AD_KEYWORDS_WEAK];
+function buildBuiltinAdRegex(strong: string[], weak: string[]): string[] {
+  const all = [...strong, ...weak];
   const uniq = new Set<string>();
   for (const k of all) {
     if (!k) continue;
@@ -87,24 +90,25 @@ function buildBuiltinAdRegex(): string[] {
   ];
 }
 
-const BUILTIN_AD_REGEX: string[] = buildBuiltinAdRegex();
-
 /**
  * ★ 2026-11-10：URL 是否为广告（供 LocalProxyServer 在 `/play` 入口直接拦截）。
  *   判定规则：hostname 的每个 label、pathname 的每个 segment 解码后，**完整命中**强关键词。
  *   例：`casino.example.com/x.ts` 命中；`casino-xxx.ts` 不命中（避免误伤）。
+ *   `strong` 未传时用默认关键词；配置页改了关键词后由调用方传新值。
  */
-export function isAdKeywordUrl(url: string): boolean {
+export function isAdKeywordUrl(url: string, strong: string[] = DEFAULT_AD_KEYWORDS_STRONG): boolean {
+  const list = strong.map((s) => s.toLowerCase()).filter(Boolean);
+  if (!list.length) return false;
   try {
     const u = new URL(url);
     for (const label of u.hostname.split('.')) {
-      if (label && BUILTIN_AD_KEYWORDS_STRONG.includes(label.toLowerCase())) return true;
+      if (label && list.includes(label.toLowerCase())) return true;
     }
     for (const seg of u.pathname.split('/')) {
       if (!seg) continue;
       let d = seg;
       try { d = decodeURIComponent(seg); } catch { /* 保持原样 */ }
-      if (BUILTIN_AD_KEYWORDS_STRONG.includes(d.toLowerCase())) return true;
+      if (list.includes(d.toLowerCase())) return true;
     }
   } catch {
     /* 非法 URL 不拦截 */
@@ -1050,11 +1054,15 @@ export function hostRegexFor(tsUrlPre: string, rules: RuleItem[] | null | undefi
 /**
  * ★ 2026-11-10（用户要求）：软件内置广告关键词规则（赌场/娱乐城/博彩/…）。
  *   与订阅规则解耦，独立导出；调用方在需要时拼接：
- *     `[...hostRegexFor(url, rules), ...builtinAdRegex()]`
+ *     `[...hostRegexFor(url, rules), ...builtinAdRegex(strong, weak)]`
  *   返回的每一项都可直接交给 `purifyM3u8` 的 `rules` 参数。
+ *   `strong` / `weak` 未传时用默认关键词；配置页改关键词后由调用方传新值。
  */
-export function builtinAdRegex(): string[] {
-  return BUILTIN_AD_REGEX.slice();
+export function builtinAdRegex(
+  strong: string[] = DEFAULT_AD_KEYWORDS_STRONG,
+  weak: string[] = DEFAULT_AD_KEYWORDS_WEAK,
+): string[] {
+  return buildBuiltinAdRegex(strong, weak);
 }
 
 /**
