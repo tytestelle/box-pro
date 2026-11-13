@@ -151,8 +151,6 @@ export function registerIpc(host: SpiderHost, dav: DavService, dlna: DlnaService
   registerHandler(IPC.CFG_SET_ACTIVE_SOURCE, (_e: any, key: string) => host.cfgSetActiveSource(key), log);
   registerHandler(IPC.CFG_SET_ACTIVE_LIVE, (_e: any, index: number) => host.cfgSetActiveLive(index), log);
 
-  // 2026-10-14: after network subscription import, broadcast live:changed too
-  // (subscription may carry lives). Renderer only refreshes list, no side effect if empty.
   registerHandler(IPC.CFG_IMPORT_URL, async (_e: any, a: { url: string; name?: string }) => {
     const r = await host.importConfig({ url: a.url, name: a.name });
     broadcastLiveChanged({ name: a.name });
@@ -342,8 +340,6 @@ export function registerIpc(host: SpiderHost, dav: DavService, dlna: DlnaService
   }, log);
 
   // ★ 2026-11-10（用户要求）：从网络 URL 导入 .py 源。
-  //   下载 / 校验 / 写入 imports/py/net-<sha1>/<filename>.py + _meta.json 由 SpiderHost.importPyFromUrl 完成；
-  //   这里只做 IPC 转发与错误包装。channel 直接用字符串（同 'player:close'），不改 IPC 常量表。
   registerHandler('cfg:importPyUrl', async (_e: any, url: string): Promise<{ ok: boolean; key?: string; error?: string }> => {
     try {
       const r = await host.importPyFromUrl(String(url || ''));
@@ -354,7 +350,6 @@ export function registerIpc(host: SpiderHost, dav: DavService, dlna: DlnaService
   }, log);
 
   // ★ 2026-11-10（用户要求）：广告关键词读写（配置页「m3u8 去广告 · 规则」按钮）。
-  //   `strong` / `weak` 传 undefined = 不改；传 [] = 用户显式清空（不再回落到默认）。
   registerHandler('ad-keywords:get', () => adKeywordSettings.settings, log);
   registerHandler('ad-keywords:set', (_e: any, patch: Partial<{ strong: string[]; weak: string[] }>) =>
     adKeywordSettings.update(patch || {}), log);
@@ -401,7 +396,6 @@ export function registerIpc(host: SpiderHost, dav: DavService, dlna: DlnaService
     }
   }, log);
 
-  // 2026-10-14: after local TXT/M3U live import, broadcast + preload.
   registerHandler(IPC.CFG_IMPORT_LIVE_LOCAL, async (e: any): Promise<{
     ok: boolean; name?: string; index?: number; replaced?: boolean; total?: number; error?: string;
   }> => {
@@ -609,7 +603,14 @@ export function registerIpc(host: SpiderHost, dav: DavService, dlna: DlnaService
     return { ok: true, path };
   }, log);
 
-  registerHandler(IPC.LIVE_LOAD, (_e: any, index: number) => host.loadLive(index), log);
+  // ★ 2026-11-13（用户要求）：LIVE_LOAD 接受 opts.forceRefresh —— 订阅源更新后
+  //   LivePage 用它绕过 SpiderHost.loadLive 的 5 分钟内存缓存，拿到真实新 groups + 新 EPG URL。
+  //   兼容旧调用：传 number 或 { index } 都行。
+  registerHandler(IPC.LIVE_LOAD, (_e: any, a: number | { index: number; forceRefresh?: boolean }) => {
+    if (typeof a === 'number') return host.loadLive(a);
+    const idx = Number(a?.index) || 0;
+    return host.loadLive(idx, { forceRefresh: !!a?.forceRefresh });
+  }, log);
   registerHandler(
     IPC.LIVE_EPG,
     (_e: any, a: { index: number; channels: EpgChannelRef[] }) => host.loadLiveEpg(Number(a?.index) || 0, a?.channels || []),
