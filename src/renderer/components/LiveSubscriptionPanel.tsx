@@ -62,6 +62,17 @@ export default function LiveSubscriptionPanel() {
 
   useEffect(() => { void load(); }, [load]);
 
+  /**
+   * ★ 2026-11-13（用户要求）：主进程后台校验到订阅源有变化 / 更新失败时，
+   *   广播 `live:subscriptions-changed`。面板监听并静默刷新列表，
+   *   让「更新于 xxx」「错误：xxx」即时反映，不用手动切 tab。
+   */
+  useEffect(() => {
+    const w = window as any;
+    const off = w?.winboxIpc?.on?.('live:subscriptions-changed', () => { void load(); });
+    return () => { if (typeof off === 'function') off(); };
+  }, [load]);
+
   async function onAdd() {
     const name = formName.trim();
     const url = formUrl.trim();
@@ -162,7 +173,8 @@ export default function LiveSubscriptionPanel() {
         并自动注册到 <code>UserConfig.lives</code> —— 与「导入本地直播源」等价。<br />
         直播页顶部的<b>线路下拉</b>里会多出一条「【订阅】xxx」，选它即可播放。<br />
         支持 <code>.m3u / .m3u8 / .txt / .json</code>（无后缀默认按 m3u 处理）；<br />
-        GitHub 链接直连失败会自动尝试 ghproxy 镜像。
+        GitHub 链接直连失败会自动尝试 ghproxy 镜像。<br />
+        <b>启动时自动校验更新</b>：有变化才重新下载并覆盖直播页线路；网络源不存在时保留旧文件继续播放。
       </div>
 
       {err && (
