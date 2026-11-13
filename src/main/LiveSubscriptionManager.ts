@@ -19,7 +19,8 @@ import type {
   UserConfig,
 } from '../shared/types';
 import { LOCAL_PROXY_BASE } from '../shared/constants';
-import { localLiveUrl } from '../../engine/live/localLive';
+// ★ 2026-11-13 修复 TS2307：本文件在 src/main/ 下，到 src/engine 只需往上一级（此前多写了一级 '..'）。
+import { localLiveUrl } from '../engine/live/localLive';
 import { UserConfigManager } from './store/UserConfigManager';
 
 // =========================================================================
