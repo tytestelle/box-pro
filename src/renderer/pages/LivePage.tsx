@@ -3,6 +3,8 @@
 //   · 名字变了、URL 没变 → 只刷新 groups / 频道列表，playUrl 不动，播放继续；
 //   · 当前频道 URL 变了 → setPlayUrl(新地址)，LiveVideoPlayer 因 key 变化重挂，用新地址播；
 //   · 当前频道在新源里找不到 / 订阅源更新失败 → 保留旧 groups + 旧 playUrl，继续播。
+//   · 订阅更新后 loadLive 用 { forceRefresh: true } 绕过 5 分钟内存缓存，groups 一换 →
+//     下方 [groups] 依赖的 EPG useEffect 自动重新拉 EPG，与新源保持一致。
 import { useEffect, useRef, useState, useCallback } from 'react';
 import Hls from 'hls.js';
 import { client } from '../api/client';
@@ -289,13 +291,18 @@ export default function LivePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [liveIdx]);
 
-  async function loadLiveInternal(index: number, meta?: LiveBean[]) {
+  /**
+   * ★ 2026-11-13：加 `forceRefresh` 参数 —— 订阅源更新后调用时传 true，
+   *   绕过 SpiderHost.loadLive 的 5 分钟内存缓存，拿到真实新 groups + 新 EPG URL。
+   *   普通切线路 / 首次加载不传（走缓存，快）。
+   */
+  async function loadLiveInternal(index: number, meta?: LiveBean[], forceRefresh = false) {
     const m = meta ?? lives;
     if (!m.length) return;
     setLoading(true);
     setErr('');
     try {
-      const r = await client.loadLive(index);
+      const r = await client.loadLive(index, { forceRefresh });
       setGroups(r.groups);
       if (r.groups.length) {
         const mem = loadLiveMem();
@@ -353,16 +360,39 @@ export default function LivePage() {
     } catch { /* ignore */ }
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const cfg = await client.cfgGet();
+        const m = await client.liveMeta();
+        if (cancelled) return;
+        setLives(m);
+        if (m.length) {
+          const start = cfg.ui.activeLiveIndex < m.length ? cfg.ui.activeLiveIndex : 0;
+          setLiveIdx(start);
+          await loadLiveInternal(start, m);
+        }
+      } catch (e) {
+        if (!cancelled) setErr((e as Error).message);
+      }
+    })();
+    void loadSubStatus();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   /**
    * ★ 2026-11-13（用户要求）：订阅源内容有变化 → 精细 diff，不做无脑重置。
    *
    *   步骤：
    *   1) 拿新线路列表（lives），若当前 liveIdx 越界则 clamp；
-   *   2) 拿新 groups（client.loadLive(idx)）；
+   *   2) 拿新 groups（client.loadLive(idx, { forceRefresh: true }) —— 绕过 5 分钟缓存）；
    *   3) diff 当前正在播的 {groupName, channelName, lineIdx}：
    *      · 频道还在、URL 没变 → 只 setGroups（刷新 UI 名称/列表），playUrl 不动；
-   *      · 频道还在、URL 变了 → setGroups + setPlayUrl(新 URL)，触发重播；
-   *      · 频道没了 → 不 setGroups、不动 playUrl（保留旧列表 + 旧地址继续播）。
+   *        groups 一变，依赖它的 EPG useEffect 自动用新 EPG URL 重拉；
+   *      · 频道还在、URL 变了 → setGroups + setPlayUrl(新 URL)，触发重播 + EPG 重拉；
+   *      · 频道没了 → 不 setGroups、不动 playUrl（保留旧列表 + 旧地址继续播）；
    *   4) 任何异常 → 静默（保底旧播放继续）。
    */
   const applySubscriptionUpdate = useCallback(async () => {
@@ -378,7 +408,8 @@ export default function LivePage() {
       const idx = cur.liveIdx < newMeta.length ? cur.liveIdx : 0;
       if (idx !== cur.liveIdx) setLiveIdx(idx);
 
-      const r = await client.loadLive(idx);
+      // ★ forceRefresh: true —— 绕过 5 分钟内存缓存，拿真实新 groups + 新 EPG URL
+      const r = await client.loadLive(idx, { forceRefresh: true });
       const newGroups = r.groups;
 
       // 没有在播内容 → 只更新列表，让用户自己选
@@ -413,28 +444,6 @@ export default function LivePage() {
     } catch (e) {
       console.warn('[Live] 处理订阅更新失败（保留旧播放继续）：', e);
     }
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const cfg = await client.cfgGet();
-        const m = await client.liveMeta();
-        if (cancelled) return;
-        setLives(m);
-        if (m.length) {
-          const start = cfg.ui.activeLiveIndex < m.length ? cfg.ui.activeLiveIndex : 0;
-          setLiveIdx(start);
-          await loadLiveInternal(start, m);
-        }
-      } catch (e) {
-        if (!cancelled) setErr((e as Error).message);
-      }
-    })();
-    void loadSubStatus();
-    return () => { cancelled = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // ★ 2026-11-13：监听主进程广播的订阅更新（带 payload），做精细 diff
@@ -521,6 +530,7 @@ export default function LivePage() {
     }
   }
 
+  // ★ 2026-11-13：订阅更新后 groups 一换，这里会自动用新 EPG URL 重拉 EPG
   useEffect(() => {
     if (!groups.length) return;
     void refreshEpg(liveIdx, groups, channelName);
