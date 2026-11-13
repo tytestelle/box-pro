@@ -32,7 +32,7 @@ const api = {
         result?: { config: SiteConfig; report: ImportReport; warnings: string[]; urls?: { name: string; url: string }[] };
       }>(IPC.CFG_IMPORT_JSON_LOCAL, name),
     importPyLocal: () => invoke<{ ok: boolean; key?: string; error?: string }>(IPC.CFG_IMPORT_PY_LOCAL),
-    // ★ 2026-11-10（用户要求）：网络 .py 文件导入（下载 → 校验 → imports/py/net-<sha1>/ → 加入源）
+    // ★ 2026-11-10（用户要求）：网络 .py 文件导入
     importPyUrl: (url: string) => invoke<{ ok: boolean; key?: string; error?: string }>('cfg:importPyUrl', url),
     importLiveLocal: () =>
       invoke<{ ok: boolean; name?: string; index?: number; replaced?: boolean; total?: number; error?: string }>(IPC.CFG_IMPORT_LIVE_LOCAL),
@@ -90,11 +90,12 @@ const api = {
       invoke<{ ok: boolean; player?: string; error?: string }>(IPC.VOD_OPEN_EXTERNAL, a),
   },
   live: {
-    load: (index: number) => invoke(IPC.LIVE_LOAD, index),
+    // ★ 2026-11-13（用户要求）：opts.forceRefresh —— 订阅源更新后绕过 5 分钟内存缓存。
+    //   兼容旧调用：`load(index)` / `load(index, { forceRefresh: true })` 都行。
+    load: (index: number, opts?: { forceRefresh?: boolean }) =>
+      invoke(IPC.LIVE_LOAD, { index, forceRefresh: !!opts?.forceRefresh }),
     meta: () => invoke('live:meta'),
-    /** ★ 2026-09-29 EPG：传入该线路的频道引用，返回各键的当前/下一档 */
     epg: (index: number, channels: unknown) => invoke(IPC.LIVE_EPG, { index, channels }),
-    /** ★ 2026-10-13 EPG 直查：某频道完整节目单（支持单 key 或多 key 数组，按顺序尝试） */
     epgPrograms: (channelNames: string | string[]) => invoke(IPC.EPG_PROGRAMS, channelNames),
     epgCurrent: (channelName: string) => invoke(IPC.EPG_CURRENT, channelName),
     epgNext: (channelName: string) => invoke(IPC.EPG_NEXT, channelName),
@@ -264,18 +265,6 @@ const api = {
 contextBridge.exposeInMainWorld('api', api);
 export type Api = typeof api;
 
-// =========================================================================
-// ★ 2026-10-13（用户报「订阅源添加失败：IPC 桥不可用」）：
-//   上面 api 里的每个方法都通过 IPC.* 常量走特定 channel；
-//   而网络直播订阅源用的是动态 channel（'live:subscription:xxx'），
-//   无法预先在 api 里列出，所以这里额外暴露一个通用 invoke 桥。
-//   渲染层 ipcInvoke() 会优先使用 window.winboxIpc.invoke。
-//
-// ★ 2026-10-13（修复"注册到直播页但实际看不到"）：
-//   主进程 LiveSubscriptionManager 会在订阅源 CRUD / 刷新后广播
-//   'live:subscriptions-changed'，直播页与弹窗据此即时刷新，无需重启。
-//   这里同时暴露 on/off 让渲染层能监听主进程事件。
-// =========================================================================
 contextBridge.exposeInMainWorld('winboxIpc', {
   invoke: (channel: string, ...args: unknown[]) => ipcRenderer.invoke(channel, ...args),
   on: (channel: string, cb: (...args: unknown[]) => void): (() => void) => {
