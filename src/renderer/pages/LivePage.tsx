@@ -1,4 +1,8 @@
-
+// src/renderer/pages/LivePage.tsx
+// ★ 2026-11-13（用户要求）：网络直播源更新时的精细 diff —— 不无脑重置播放。
+//   · 名字变了、URL 没变 → 只刷新 groups / 频道列表，playUrl 不动，播放继续；
+//   · 当前频道 URL 变了 → setPlayUrl(新地址)，LiveVideoPlayer 因 key 变化重挂，用新地址播；
+//   · 当前频道在新源里找不到 / 订阅源更新失败 → 保留旧 groups + 旧 playUrl，继续播。
 import { useEffect, useRef, useState, useCallback } from 'react';
 import Hls from 'hls.js';
 import { client } from '../api/client';
@@ -23,6 +27,15 @@ function saveLiveMem(m: LiveMem): void {
 }
 
 type EpgStatus = 'idle' | 'loading' | 'ok' | 'empty' | 'error';
+
+// ★ 与 main/LiveSubscriptionManager.ts 里的 LiveSubChangedPayload 对齐
+//   （preload 不暴露那个类型，渲染层自己声明一份）
+interface LiveSubChangedPayload {
+  updated: boolean;
+  updatedIds: string[];
+  failedIds: string[];
+  reason: 'startup' | 'manual' | 'crud';
+}
 
 class StreamDetector {
   static async detect(url: string): Promise<'hls' | 'flv' | 'ts' | 'native' | 'unknown'> {
@@ -224,6 +237,13 @@ export default function LivePage() {
   const lastReconnectAtRef = useRef(0);
   const MAX_RECONNECT = 50;
 
+  // ★ 2026-11-13：把「当前播放上下文」用 ref 存一份，供订阅更新回调读取
+  //   （避免把 liveIdx/groupName/... 都放进 useEffect 依赖导致频繁重订阅）
+  const playStateRef = useRef({ liveIdx, groupName, channelName, lineIdx, playUrl });
+  useEffect(() => {
+    playStateRef.current = { liveIdx, groupName, channelName, lineIdx, playUrl };
+  }, [liveIdx, groupName, channelName, lineIdx, playUrl]);
+
   useEffect(() => {
     if (!playUrl) { setPlaybackUrl(''); return; }
     setPlaybackUrl(playUrl);
@@ -333,6 +353,68 @@ export default function LivePage() {
     } catch { /* ignore */ }
   }, []);
 
+  /**
+   * ★ 2026-11-13（用户要求）：订阅源内容有变化 → 精细 diff，不做无脑重置。
+   *
+   *   步骤：
+   *   1) 拿新线路列表（lives），若当前 liveIdx 越界则 clamp；
+   *   2) 拿新 groups（client.loadLive(idx)）；
+   *   3) diff 当前正在播的 {groupName, channelName, lineIdx}：
+   *      · 频道还在、URL 没变 → 只 setGroups（刷新 UI 名称/列表），playUrl 不动；
+   *      · 频道还在、URL 变了 → setGroups + setPlayUrl(新 URL)，触发重播；
+   *      · 频道没了 → 不 setGroups、不动 playUrl（保留旧列表 + 旧地址继续播）。
+   *   4) 任何异常 → 静默（保底旧播放继续）。
+   */
+  const applySubscriptionUpdate = useCallback(async () => {
+    const cur = playStateRef.current;
+    try {
+      const newMeta = await client.liveMeta();
+      if (!Array.isArray(newMeta) || newMeta.length === 0) {
+        console.warn('[Live] 订阅更新后线路列表为空，保留旧列表与旧地址继续播放');
+        return;
+      }
+      setLives(newMeta);
+
+      const idx = cur.liveIdx < newMeta.length ? cur.liveIdx : 0;
+      if (idx !== cur.liveIdx) setLiveIdx(idx);
+
+      const r = await client.loadLive(idx);
+      const newGroups = r.groups;
+
+      // 没有在播内容 → 只更新列表，让用户自己选
+      if (!cur.groupName || !cur.channelName) {
+        setGroups(newGroups);
+        return;
+      }
+
+      // 找当前正在播的频道
+      const curGroup = newGroups.find((g) => g.group === cur.groupName);
+      const curChannel = curGroup?.channels.find((c) => c.name === cur.channelName);
+
+      if (!curGroup || !curChannel) {
+        // ★ 频道在新源里已消失：保留旧 groups + 旧 playUrl，继续播
+        console.info('[Live] 当前频道已从更新后的源中消失，保留旧列表与旧地址继续播放');
+        return;
+      }
+
+      // 频道还在 → 更新 groups（UI 名称/频道列表跟着变）
+      setGroups(newGroups);
+
+      const newLine = splitLine(curChannel.urls[cur.lineIdx] || curChannel.urls[0], cur.lineIdx + 1);
+      const newUrl = newLine.url || '';
+      if (newUrl && newUrl !== cur.playUrl) {
+        // ★ URL 变了 → 用新地址重播
+        console.info('[Live] 当前频道地址已更新，使用新地址重播');
+        setPlayUrl(newUrl);
+      } else {
+        // ★ URL 没变 → 只刷新 UI，不动 playUrl，播放继续
+        console.info('[Live] 当前频道地址未变，仅刷新频道列表');
+      }
+    } catch (e) {
+      console.warn('[Live] 处理订阅更新失败（保留旧播放继续）：', e);
+    }
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -355,16 +437,34 @@ export default function LivePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // ★ 2026-11-13：监听主进程广播的订阅更新（带 payload），做精细 diff
   useEffect(() => {
     const w = window as any;
-    const off = w?.winboxIpc?.on?.('live:subscriptions-changed', () => {
+    const off = w?.winboxIpc?.on?.('live:subscriptions-changed', (payload?: LiveSubChangedPayload) => {
       void loadSubStatus();
-      void reloadLives();
+
+      // 没有 payload（旧版主进程广播）→ 兼容处理：视为 CRUD，仅刷新线路列表
+      if (!payload) {
+        void reloadLives();
+        return;
+      }
+
+      // 内容没有更新（只有失败 / 纯 CRUD）：
+      //   · 失败：保留旧播放继续，只是订阅计数变了（已由 loadSubStatus 处理）；
+      //   · CRUD（增删改订阅源）：刷新线路列表（可能删除的就是当前线路）。
+      if (!payload.updated) {
+        if (payload.reason === 'crud') void reloadLives();
+        return;
+      }
+
+      // 有内容更新 → 精细 diff
+      void applySubscriptionUpdate();
     });
     return () => { if (typeof off === 'function') off(); };
-  }, [loadSubStatus, reloadLives]);
+  }, [loadSubStatus, reloadLives, applySubscriptionUpdate]);
 
   // ★ 2026-10-14（用户要求）：监听主进程广播的「直播源已变更」→ 自动重新加载
+  //   （来自配置页「导入本地 TXT/M3U」，与网络订阅源的精细 diff 分开处理）
   useEffect(() => {
     const w = window as any;
     const off = w?.winboxIpc?.on?.('live:changed', (payload: { index?: number; name?: string; replaced?: boolean }) => {
@@ -441,17 +541,9 @@ export default function LivePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [epg, groupName, channelName, liveIdx]);
 
-  /**
-   * ★ 2026-10-14（用户要求）：打开 EPG 独立窗口。
-   *   - 传 `groups`（整个直播源的**所有分组**）+ `currentGroup`（当前分组名）
-   *     → EPG 窗口左侧渲染「分组 → 频道」列表，点分组展开、点频道加载其节目预告。
-   *   - 传 `channelName / tvgId / tvgName` 作为「初始频道」= 主窗口**当前正在播放的频道**
-   *     → EPG 窗口顶部「↩ 当前」按钮可一键切回。
-   */
   async function openPrograms(channel: { name: string; 'tvg-id'?: string; 'tvg-name'?: string }) {
     const name = (channel.name || '').trim();
     if (!name) return;
-    // ★ 传整个直播源的所有分组（不只是当前分组）
     const groupList = groups
       .map((g) => ({
         group: String(g.group || '').trim(),
@@ -605,7 +697,6 @@ export default function LivePage() {
           )}
         </div>
       </div>
-      {/* ★ 2026-10-14：节目单弹窗已改为独立窗口（见 main/player/EpgWindow.ts + pages/EpgWinPage.tsx）*/}
     </>
   );
 }
