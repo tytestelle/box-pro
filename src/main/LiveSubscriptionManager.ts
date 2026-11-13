@@ -5,23 +5,11 @@
 //   <userData>/live-subscriptions/index.json   元数据
 //   <userData>/live-subscriptions/files/<id>.<ext>   下载的源文件
 //
-// ★★ 2026-10-13 核心重构（用户报「网络源添加后直播页只有名称没内容」）★★
-//   此前自己拼 `file:///<绝对路径>` 写进 UserConfig.lives —— 直播页加载器**只认**
-//   `http://127.0.0.1:9978/file/local-live/<文件名>` 形态，所以引擎读到后当成不支持的 url
-//   → 顶部下拉有名字，点进去「无直播（请先导入含 lives 的配置）」。
-//
-//   修复：下载完成后**不再自己构造 LiveBean**，而是走 bindLiveImporter 注入的
-//   importLiveFileFromPath（与「配置页 · 导入本地 TXT/M3U」同一条链路）——
-//   它负责：编码归一化 → 落 <userData>/local-live/sub-<id>.<ext> → parseLive → host.cfgAddLive。
-//   删除时按 api 精确移除；启动时自动检查更新（有变化才重新导入）。
-//
-// ★★ 2026-10-13 追加：本地源管理 ★★
-//   「配置页 · 导入直播源（本地文件）」写入的 lives 条目也走同一目录 `local-live/`，
-//   但**文件名不以 `sub-` 开头**（网络订阅源才以 `sub-` 开头）。
-//   本模块新增 listLocalLiveSources / removeLocalLiveSource：
-//     · list    —— 从 UserConfig.lives 里筛出「api 以 /file/local-live/ 开头 且 文件名非 sub-*」的条目
-//     · remove  —— 按 api 精确删除该线路 + 同时删除 <userData>/local-live/<文件名> 文件
-
+// ★★ 2026-11-13（用户要求）：启动即校验 + 更新后广播 payload ★★
+//   - 校验逻辑：拉远端文本 → 与本地缓存逐字节对比 → 一致跳过 / 有变化重新导入；
+//   - 失败：保留旧文件、保留 lives 条目，只记 lastError（用户要求「源不存在保留旧的继续播放」）；
+//   - 广播：notifyLiveSubscriptionsChanged(payload) 带 updatedIds / failedIds / reason，
+//     渲染层据此做精细 diff（名字变了只刷新 UI、URL 变了重播、频道没了继续播）。
 import { app, ipcMain, BrowserWindow } from 'electron';
 import * as fs from 'fs/promises';
 import * as path from 'path';
@@ -31,7 +19,7 @@ import type {
   UserConfig,
 } from '../shared/types';
 import { LOCAL_PROXY_BASE } from '../shared/constants';
-import { localLiveUrl } from '../engine/live/localLive';
+import { localLiveUrl } from '../../engine/live/localLive';
 import { UserConfigManager } from './store/UserConfigManager';
 
 // =========================================================================
@@ -55,18 +43,36 @@ export const LIVE_LOCAL_CHANNELS = {
 
 export const LIVE_SUB_CHANGED_CHANNEL = 'live:subscriptions-changed';
 
-export function notifyLiveSubscriptionsChanged(): void {
+// ★ 2026-11-13（用户要求）：广播带 payload，渲染层据此做精细 diff
+export interface LiveSubChangedPayload {
+  /** 本次是否有订阅源内容变化并重新导入（true 才需要 diff） */
+  updated: boolean;
+  /** 更新成功的订阅源 id（内容有变化并重新导入的） */
+  updatedIds: string[];
+  /** 更新失败的订阅源 id（保留旧文件继续使用） */
+  failedIds: string[];
+  /** 触发原因：startup（启动校验）/ manual（手动刷新）/ crud（增删改） */
+  reason: 'startup' | 'manual' | 'crud';
+}
+
+const EMPTY_PAYLOAD: LiveSubChangedPayload = {
+  updated: false,
+  updatedIds: [],
+  failedIds: [],
+  reason: 'crud',
+};
+
+export function notifyLiveSubscriptionsChanged(payload?: LiveSubChangedPayload): void {
+  const p = payload ?? EMPTY_PAYLOAD;
   for (const w of BrowserWindow.getAllWindows()) {
     try {
-      if (!w.isDestroyed()) w.webContents.send(LIVE_SUB_CHANGED_CHANNEL);
+      if (!w.isDestroyed()) w.webContents.send(LIVE_SUB_CHANGED_CHANNEL, p);
     } catch { /* ignore */ }
   }
 }
 
 // =========================================================================
-// ★ 可注入的「本地文件导入」函数
-//   主进程 index.ts 在 registerLiveSubscriptionIpc() 之前调用 bindLiveImporter(...) 接线。
-//   不注入 = 任何 CRUD 都会抛错（防「悄悄不注册」）。
+// 可注入的「本地文件导入」函数
 // =========================================================================
 export interface LiveImporterResult {
   ok: boolean;
@@ -165,16 +171,9 @@ async function writeUserConfig(cfg: UserConfig): Promise<void> {
 
 // =========================================================================
 // 订阅源在 lives 里的稳定标识
-//
-// - 落盘到 <userData>/local-live/ 的文件名 = `sub-<id>.<ext>`（本模块管理）
-// - 注册进 lives 的 api = localLiveUrl(LOCAL_PROXY_BASE, 上面那个文件名)
-//   —— 与"导入本地 TXT/M3U"完全同构；且**稳定可计算**，删除/停用时按它精确清理。
-// - LiveBean.name 用「【订阅】xxx」前缀，直播页下拉一眼区分。
 // =========================================================================
 const SUB_BEAN_PREFIX = '【订阅】';
 const LOCAL_LIVE_SUBDIR = 'local-live';
-
-/** /file 路由前缀（本地直播源都走这条） */
 const LOCAL_LIVE_API_PREFIX = `${LOCAL_PROXY_BASE}/file/local-live/`;
 
 function extForUrl(url: string): string {
@@ -184,27 +183,22 @@ function extForUrl(url: string): string {
   return 'm3u';
 }
 
-/** 本模块管理的本地文件名（稳定） */
 function stableFileNameOf(subId: string, url: string): string {
   return `sub-${subId}.${extForUrl(url)}`;
 }
 
-/** 注册进 lives 的 api（= 直播页加载器唯一认得的形态） */
 function apiOf(subId: string, url: string): string {
   return localLiveUrl(LOCAL_PROXY_BASE, stableFileNameOf(subId, url));
 }
 
-/** 是否为「/file/local-live/」形态的本地源 api */
 function isLocalLiveApi(api: string): boolean {
   return typeof api === 'string' && api.startsWith(LOCAL_LIVE_API_PREFIX);
 }
 
-/** 是否为「本模块（网络订阅源）管理」的本地文件名（`sub-*` 前缀） */
 function isSubscriptionLocalFileName(fileName: string): boolean {
   return fileName.startsWith('sub-');
 }
 
-/** 从 lives 里移除本订阅源的线路（按 api 精确匹配，经 UserConfigManager 内存快照变更） */
 async function removeSubFromLives(sub: LiveSubscription): Promise<void> {
   const uc = UserConfigManager.current;
   if (!uc) {
@@ -216,7 +210,6 @@ async function removeSubFromLives(sub: LiveSubscription): Promise<void> {
   if (ok) console.info(`[LiveSub] 已从 lives 移除：${api}`);
 }
 
-/** 下载到 <userData>/live-subscriptions/files/<id>.<ext>（仅做元数据缓存，供「对比是否变化」用） */
 async function downloadToCache(sub: LiveSubscription): Promise<string> {
   const text = await fetchText(sub.url);
   if (!text || !text.trim()) throw new Error('订阅内容为空');
@@ -331,7 +324,6 @@ export async function addSubscription(name: string, url: string): Promise<LiveSu
     enabled: true,
   };
 
-  // 1) 下载到缓存目录（用于「检查更新」时对比内容）
   try {
     sub.localFile = await downloadToCache(sub);
     sub.lastUpdated = new Date().toISOString();
@@ -339,7 +331,6 @@ export async function addSubscription(name: string, url: string): Promise<LiveSu
     sub.lastError = (e as Error).message;
   }
 
-  // 2) 下载成功 → 走「本地文件导入」链路注册到 lives（与配置页按钮同一路径）
   if (sub.localFile) {
     const r = liveImporter(sub.localFile, {
       customName: `${SUB_BEAN_PREFIX}${sub.name}`,
@@ -348,12 +339,11 @@ export async function addSubscription(name: string, url: string): Promise<LiveSu
     if (!r.ok) sub.lastError = r.error || '注册失败';
   }
 
-  // 3) 落库
   const subs = await listSubscriptions();
   subs.push(sub);
   await saveSubscriptions(subs);
 
-  notifyLiveSubscriptionsChanged();
+  notifyLiveSubscriptionsChanged(EMPTY_PAYLOAD);
   return sub;
 }
 
@@ -365,14 +355,13 @@ export async function removeSubscription(id: string): Promise<void> {
 
   try { await removeSubFromLives(sub); } catch (e) { console.warn('[LiveSub] 移除 lives 失败：', e); }
   await deleteLocalFile(sub.localFile);
-  // 同时删除 <userData>/local-live/ 里的副本
   try {
     await fs.rm(path.join(localLiveDir(), stableFileNameOf(sub.id, sub.url)), { force: true });
   } catch { /* ignore */ }
   subs.splice(idx, 1);
   await saveSubscriptions(subs);
 
-  notifyLiveSubscriptionsChanged();
+  notifyLiveSubscriptionsChanged(EMPTY_PAYLOAD);
 }
 
 export async function updateSubscription(
@@ -402,7 +391,6 @@ export async function updateSubscription(
   const enabledChanged = old.enabled !== next.enabled;
   const nameChanged = old.name !== next.name;
 
-  // 停用 → 从 lives 移除（保留本地缓存文件，方便快速重启用）
   if (!next.enabled) {
     if (old.enabled) {
       try { await removeSubFromLives(old); } catch { /* ignore */ }
@@ -414,11 +402,10 @@ export async function updateSubscription(
     }
     subs[idx] = next;
     await saveSubscriptions(subs);
-    notifyLiveSubscriptionsChanged();
+    notifyLiveSubscriptionsChanged(EMPTY_PAYLOAD);
     return next;
   }
 
-  // 启用（或保持启用）：
   const needDownload = urlChanged || !old.localFile || !(await fileExists(old.localFile));
 
   if (needDownload) {
@@ -449,7 +436,7 @@ export async function updateSubscription(
 
   subs[idx] = next;
   await saveSubscriptions(subs);
-  notifyLiveSubscriptionsChanged();
+  notifyLiveSubscriptionsChanged(EMPTY_PAYLOAD);
   return next;
 }
 
@@ -473,7 +460,7 @@ export async function moveSubscription(
   subs.splice(target, 0, item);
   await saveSubscriptions(subs);
 
-  notifyLiveSubscriptionsChanged();
+  notifyLiveSubscriptionsChanged(EMPTY_PAYLOAD);
   return subs;
 }
 
@@ -485,6 +472,8 @@ export async function refreshAllSubscriptions(): Promise<LiveSubscriptionRefresh
   if (!liveImporter) return results;
   const subs = await listSubscriptions();
   let dirty = false;
+  const updatedIds: string[] = [];
+  const failedIds: string[] = [];
 
   for (const sub of subs) {
     if (!sub.enabled) {
@@ -501,10 +490,12 @@ export async function refreshAllSubscriptions(): Promise<LiveSubscriptionRefresh
       sub.lastUpdated = new Date().toISOString();
       sub.lastError = undefined;
       results.push({ id: sub.id, name: sub.name, ok: true, lastUpdated: sub.lastUpdated });
+      updatedIds.push(sub.id);
       dirty = true;
     } catch (e) {
       const msg = (e as Error)?.message || String(e);
       sub.lastError = msg;
+      failedIds.push(sub.id);
       results.push({ id: sub.id, name: sub.name, ok: false, error: msg });
       dirty = true;
     }
@@ -513,12 +504,17 @@ export async function refreshAllSubscriptions(): Promise<LiveSubscriptionRefresh
   if (dirty) {
     try { await saveSubscriptions(subs); } catch { /* ignore */ }
   }
-  notifyLiveSubscriptionsChanged();
+  notifyLiveSubscriptionsChanged({
+    updated: updatedIds.length > 0,
+    updatedIds,
+    failedIds,
+    reason: 'manual',
+  });
   return results;
 }
 
 // =========================================================================
-// ★ 2026-10-13：启动时自动检查更新 —— 有变化才重新导入；无变化则保留原样。
+// ★ 启动时自动检查更新 —— 有变化才重新导入；无变化则保留原样。
 // =========================================================================
 export interface CheckUpdateSummary {
   updated: number;
@@ -532,7 +528,8 @@ export interface CheckUpdateSummary {
  *   2) 与本地缓存逐字节对比；
  *   3) **一致 → 跳过**（不动 lives、不动本地文件）；
  *   4) **有变化 → 覆盖本地文件 + 走本地导入链路重新注册**（replaced=true 覆盖同条目）；
- *   5) 失败 → 记录 lastError，继续处理下一个。
+ *   5) 失败 → 记录 lastError，**不动本地文件**（用户要求「源不存在保留旧的继续播放」）。
+ *   最后按 updatedIds / failedIds 广播，渲染层做精细 diff。
  */
 export async function checkAndUpdateSubscriptions(): Promise<CheckUpdateSummary> {
   const summary: CheckUpdateSummary = { updated: 0, skipped: 0, failed: 0 };
@@ -540,6 +537,8 @@ export async function checkAndUpdateSubscriptions(): Promise<CheckUpdateSummary>
 
   const subs = await listSubscriptions();
   let dirty = false;
+  const updatedIds: string[] = [];
+  const failedIds: string[] = [];
 
   for (const sub of subs) {
     if (!sub.enabled) { summary.skipped++; continue; }
@@ -569,42 +568,44 @@ export async function checkAndUpdateSubscriptions(): Promise<CheckUpdateSummary>
       sub.lastUpdated = new Date().toISOString();
       sub.lastError = undefined;
       summary.updated++;
+      updatedIds.push(sub.id);
       dirty = true;
       console.info(`[LiveSub] 订阅「${sub.name}」有更新，已重新导入到 lives`);
     } catch (e) {
+      // ★ 用户要求：源不存在 / 网络失败 → 保留旧文件、保留 lives 条目，只记 lastError
       sub.lastError = (e as Error)?.message || String(e);
       summary.failed++;
+      failedIds.push(sub.id);
       dirty = true;
-      console.warn(`[LiveSub] 订阅「${sub.name}」检查更新失败：${sub.lastError}`);
+      console.warn(`[LiveSub] 订阅「${sub.name}」检查更新失败（保留旧文件）：${sub.lastError}`);
     }
   }
 
   if (dirty) {
     try { await saveSubscriptions(subs); } catch { /* ignore */ }
   }
-  if (summary.updated > 0) notifyLiveSubscriptionsChanged();
+  // ★ 只有真的发生了变化（成功或失败）才广播，避免无意义刷新
+  if (updatedIds.length > 0 || failedIds.length > 0) {
+    notifyLiveSubscriptionsChanged({
+      updated: updatedIds.length > 0,
+      updatedIds,
+      failedIds,
+      reason: 'startup',
+    });
+  }
   return summary;
 }
 
 // =========================================================================
-// ★ 2026-10-13：本地源管理（用户手动导入的本地 TXT/M3U；非网络订阅源）
-//
-// 识别口径：
-//   · 属于本地源：`LiveBean.url` 以 `${LOCAL_PROXY_BASE}/file/local-live/` 开头
-//   · 排除：文件名以 `sub-` 开头（那是本模块的网络订阅源，交给「网络订阅源」列表管理）
+// 本地源管理（用户手动导入的本地 TXT/M3U；非网络订阅源）
 // =========================================================================
 export interface LocalLiveSource {
-  /** 线路显示名（= LiveBean.name） */
   name: string;
-  /** 线路 api（= LiveBean.url；`http://127.0.0.1:9978/file/local-live/<文件名>`） */
   api: string;
-  /** <userData>/local-live/ 下的文件名 */
   fileName: string;
-  /** 该本地文件当前是否还存在（false = 已被手动删；线路会在下次清理时移除） */
   fileExists: boolean;
 }
 
-/** 列出「配置页 · 导入本地 TXT/M3U」写入的 lives 条目（不含网络订阅源 `sub-*`） */
 export async function listLocalLiveSources(): Promise<LocalLiveSource[]> {
   const uc = UserConfigManager.current;
   if (!uc) return [];
@@ -615,7 +616,7 @@ export async function listLocalLiveSources(): Promise<LocalLiveSource[]> {
     if (!isLocalLiveApi(api)) continue;
     const fileName = api.slice(LOCAL_LIVE_API_PREFIX.length);
     if (!fileName) continue;
-    if (isSubscriptionLocalFileName(fileName)) continue; // 网络订阅源，交给订阅列表管
+    if (isSubscriptionLocalFileName(fileName)) continue;
     out.push({
       name: String(l.name || '').trim() || fileName,
       api,
@@ -626,7 +627,6 @@ export async function listLocalLiveSources(): Promise<LocalLiveSource[]> {
   return out;
 }
 
-/** 删除一条本地源：按 api 精确移除 lives 条目 + 删除 <userData>/local-live/<文件名> */
 export async function removeLocalLiveSource(api: string): Promise<boolean> {
   const uc = UserConfigManager.current;
   if (!uc) throw new Error('配置管理器未就绪');
@@ -645,7 +645,7 @@ export async function removeLocalLiveSource(api: string): Promise<boolean> {
     } catch (e) {
       console.warn('[LiveSub] 删除本地文件失败：', e);
     }
-    notifyLiveSubscriptionsChanged();
+    notifyLiveSubscriptionsChanged(EMPTY_PAYLOAD);
     console.info(`[LiveSub] 已删除本地源：${fileName}`);
   }
   return removed;
@@ -663,7 +663,6 @@ export function registerLiveSubscriptionIpc(): void {
   ipcMain.handle(LIVE_SUB_CHANNELS.MOVE, async (_e, id: string, dir: 'up' | 'down' | 'top' | 'bottom') => moveSubscription(id, dir));
   ipcMain.handle(LIVE_SUB_CHANNELS.REFRESH_ALL, async () => refreshAllSubscriptions());
 
-  // ★ 2026-10-13：本地源管理
   ipcMain.handle(LIVE_LOCAL_CHANNELS.LIST, async () => listLocalLiveSources());
   ipcMain.handle(LIVE_LOCAL_CHANNELS.REMOVE, async (_e, api: string) => removeLocalLiveSource(String(api || '')));
 }
