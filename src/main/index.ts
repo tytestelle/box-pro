@@ -59,24 +59,11 @@ const dav = new DavService(
 const dlna = new DlnaService(fileLogger);
 /**
  * ★★ 2026-10-13（用户要求「屏蔽软件的更新功能」）★★
- *   用**哑更新器**替换真实 UpdateService：
- *     - check()   → 永远返回 hasUpdate=false（渲染层不会弹强制更新窗口 / 不锁死应用）
- *     - download()→ 永远返回 ok=false，不下载任何安装包
- *     - launch()  → 永远返回 ok=false，不拉起安装程序
- *     - downloadedPath() → 永远 null
- *   返回值同时塞入多个常见字段名（hasUpdate / latest / version / forced / mandatory 等），
- *   兼容渲染层不同读法；即便某个字段名对不上，也不会出现「undefined 让渲染层误判有更新」的情形。
- *
- *   `as unknown as UpdateService` 强转：保留真实类型签名给 registerIpc 使用，
- *   免得改 registerIpc 的参数类型。
- *
- *   ⚠ 保留 UpdateService import 是有意为之（强转需要类型）；如需彻底移除更新模块，
- *     把下面这个对象换成自定义 interface，并同步改 registerIpc 签名，改动面较大。
+ *   用**哑更新器**替换真实 UpdateService。
  */
 const updater = (() => {
   const CURRENT_VERSION = app.getVersion();
   const noopCheck = async () => ({
-    // —— 常见「有无更新」判据（覆盖多种命名习惯，全部指向「无更新」）——
     hasUpdate: false,
     updateAvailable: false,
     available: false,
@@ -86,7 +73,6 @@ const updater = (() => {
     forced: false,
     mandatory: false,
     forceUpdate: false,
-    // —— 版本号字段（统一填当前版本，避免渲染层做「latest !== current」比对时误判）——
     current: CURRENT_VERSION,
     currentVersion: CURRENT_VERSION,
     localVersion: CURRENT_VERSION,
@@ -98,7 +84,6 @@ const updater = (() => {
     tag_name: CURRENT_VERSION,
     version_name: CURRENT_VERSION,
     remoteVersion: CURRENT_VERSION,
-    // —— 下载/说明相关（一律空）——
     downloadUrl: '',
     url: '',
     notes: '',
@@ -120,8 +105,7 @@ const updater = (() => {
   } as unknown as UpdateService;
 })();
 /**
- * ★ 2026-09-29（用户要求）本地包（影视壳/影视仓 目录包）：登记表 + `/pkg` 资源路由 + py 就地运行。
- *   导入安装目录下的 imports 副本，原始包可移动/删除，不影响已导入订阅。
+ * ★ 2026-09-29（用户要求）本地包：登记表 + `/pkg` 资源路由 + py 就地运行。
  */
 const localPkgs = new LocalPkgStore(new JsonStore(join(userDataDir(), 'local-pkgs.json')), LOCAL_PROXY_BASE, localImportsDir());
 const proxy = new LocalProxyServer(
@@ -141,7 +125,6 @@ const proxy = new LocalProxyServer(
     adsFor: () => host.siteConfig?.ads || [],
     strongKeywordsFor: () => adKeywordSettings.settings.strong,
   },
-  // ★ 2026-09-29 WebDAV 取流认证（凭据只在主进程加密存储里）
   (id) => dav.authHeader(id),
 );
 // ★ 2026-09-29（用户要求）本地包：包内资源路由（/pkg/<i>/<rel>）+ 订阅 pkg:// 读取
@@ -155,28 +138,18 @@ const pushSpeed = (kbs: number): void => {
   }
 };
 proxy.onSpeed = pushSpeed;
-// ★ 2026-09-29：BT 下载速率走同一条通道（/bt 中继写回字节 + aria2 下载速率）→ 播放器「缓存中 x MB/s」
 torrent.onSpeed = pushSpeed;
-// ★ 2026-09-26：壳/蜘蛛的宿主代理（`/proxy/<jvmPort>?do=proxy&key=…`）被访问 → 钉住那个 JVM
 proxy.onSpiderProxy = (port) => host.pinSpiderProxy(port);
 proxy.onPythonProxy = (key, params) => host.pythonProxy(key, params);
-// ★ 2026-09-29：`/bt/<hash>/<idx>` 取流口（Range + piece 门控 + 本地读盘）
 proxy.bt = torrent;
 
 function isDev(): boolean {
   return !app.isPackaged && process.env.NODE_ENV !== 'production';
 }
 
-// 渲染策略：**不再强制禁用 GPU/硬件加速**。
-//   过往为"无 GPU/驱动异常环境"加了 disableHardwareAcceleration + disable-gpu + disable-software-rasterizer，
-//   但用户实测（本机有正常 GPU）强禁后无边框窗口在最大化/resize 时合成器不刷新，
-//   网页只渲染在左上角原尺寸、右侧/下方直接露出 backgroundColor（"最大化异形"）。
-//   交由 Electron/Chromium 按环境自选：有 GPU 走硬件合成（最大化正常），无 GPU 时自动回退软件。
-// no-sandbox / disable-dev-shm-usage 仍保留（子进程沙箱相关，与渲染无关）。
 app.commandLine.appendSwitch('no-sandbox');
 app.commandLine.appendSwitch('disable-dev-shm-usage');
 
-// 原生崩溃此前没有应用日志；记录进程类型/退出码，不记录资源 URL 或凭据。
 app.on('web-contents-created', (_event, contents) => {
   contents.on('render-process-gone', (_e, details) => {
     fileLogger.w(`renderer-gone wc=${contents.id} reason=${details.reason} exitCode=${details.exitCode}`);
@@ -188,18 +161,13 @@ app.on('child-process-gone', (_event, details) => {
 });
 
 function createWindow(): void {
-  // 默认跟随系统亮暗（Mica 背景会随之切换深浅）
-  // backgroundMaterial: 'mica' 仅 Win11 有效；旧版本自动降级无副作用
   const winOpts: Electron.BrowserWindowConstructorOptions = {
     width: 1280,
     height: 800,
     minWidth: 960,
     minHeight: 600,
-    // ★ 用不透明底色：无边框窗口若背景全透明，放大/最大化时未渲染区域会显示黑色残影/形状异常
-    //   （--bg-glass 本身约 90% 不透明，视觉几乎无差异，Mica 磨砂不受影响）
     backgroundColor: nativeTheme.shouldUseDarkColors ? '#0a0c10' : '#dce4ec',
     title: 'Win-Box',
-    // 无边框自定义标题栏：窗口控制（最小化/最大化/关闭）与拖拽由渲染层 TitleBar 处理
     frame: false,
     autoHideMenuBar: true,
     icon: app.isPackaged ? undefined : join(__dirname, '..', '..', 'build', 'icon.png'),
@@ -213,12 +181,9 @@ function createWindow(): void {
   };
   mainWindow = new BrowserWindow(winOpts);
 
-  // ★ Win11 无边框圆角在最大化时露出右上角黑角（关闭钮旁异形）：最大化取消圆角、还原恢复
   const setCorner = (round: boolean) => {
     if (mainWindow && !mainWindow.isDestroyed()) applyWindowCorner(mainWindow, round);
   };
-  // ★ 最大化/还原后强制重绘：无边框窗口在最大化动画期间 webContents 视口可能未铺到新尺寸，
-  //   未重绘区域会直接显示 backgroundColor（暗色）→ 观感像"小窗贴左上、右侧补背景"。强制重绘兜底。
   const refreshContent = () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       try {
@@ -267,8 +232,7 @@ app.whenReady().then(async () => {
     /* ignore */
   }
 
-  // 启动即记录资源根定位结果：打包后（尤其 portable 的 7z-out 解压布局）
-  // 若再出现「JRE 缺失」，日志首行就能看出真实路径命中情况。
+  // 启动即记录资源根定位结果
   try {
     const { resourcesDir, resourcesDirDebug } = await import('./util/paths');
     const dir = resourcesDir();
@@ -279,18 +243,13 @@ app.whenReady().then(async () => {
     fileLogger.w('资源根探测失败: ' + (e instanceof Error ? e.message : String(e)));
   }
 
-  // ★ 2026-10-09：构建标记 —— 日志排障第一行就能确认「跑的是哪只构建」。
-  //   背景：同版本号覆盖安装时用户日志无法区分新旧产物（1.20.0 两轮都叫 1.20.0），
-  //   此标记随每轮 main 改动手工递增（含当轮关键词，grep 即证）。
-    fileLogger.i(`build: 20261012.1 release-${app.getVersion()}`);
+  fileLogger.i(`build: 20261012.1 release-${app.getVersion()}`);
 
   try {
     await proxy.start();
   } catch {
     fileLogger.w('本地代理启动失败，直播归一化可能受影响');
   }
-  // ★ 网络代理设置（用户可在配置页填 http 代理；用于被 DNS 污染 / SNI 阻断的站点）。
-  //   初始化后所有出站（本进程请求 / 本地中继 / JVM 与 Python 蜘蛛 / 嗅探窗口）统一生效。
   try {
     const { initProxySettings } = await import('./net/proxy');
     const { userDataDir } = await import('./util/paths');
@@ -298,8 +257,6 @@ app.whenReady().then(async () => {
   } catch (e) {
     fileLogger.w('代理设置初始化失败：' + (e as Error).message);
   }
-  // ★ 2026-09-28：播放/落盘诊断落盘（`<userData>/logs/play-diag-*.jsonl`）
-  //   注入式（playDiag 不静态依赖 electron），供「落盘/播放成功率」排查取数。
   try {
     const { initPlayDiag } = await import('./util/playDiag');
     const { userDataDir } = await import('./util/paths');
@@ -312,33 +269,14 @@ app.whenReady().then(async () => {
   }
   registerIpc(host, dav, dlna, updater, localPkgs);
 
-  // ★ 2026-10-13：先接线「本地文件导入」函数，再注册订阅源 IPC。
-  //   网络订阅源下载后走 importLiveFileFromPath → 与「配置页 · 导入本地 TXT/M3U」完全同构，
-  //   注册进 lives 的 api 是 `http://127.0.0.1:9978/file/local-live/sub-<id>.<ext>`，
-  //   直播页加载器才认得（此前直拼 file:/// 时只有名字没有内容）。
   bindLiveImporter((srcPath, opts) => importLiveFileFromPath(host, srcPath, opts));
   registerLiveSubscriptionIpc();
 
-  // ★ 2026-10-13：启动后延迟 10 秒自动检查订阅源更新（避开启动高峰）。
-  //   有变化 → 覆盖本地文件 + 走本地导入覆盖 lives；无变化 → 保留原样不重新导入。
-  setTimeout(() => {
-    void checkAndUpdateSubscriptions()
-      .then((r) => {
-        if (r.updated > 0 || r.failed > 0) {
-          fileLogger.i(`[LiveSub] 启动自动检查：更新 ${r.updated} · 跳过 ${r.skipped} · 失败 ${r.failed}`);
-        }
-      })
-      .catch((e) => fileLogger.w(`[LiveSub] 启动自动检查异常：${(e as Error).message}`));
-  }, 10_000);
-
   // ★ 2026-11-10（用户要求）：启动后延迟 10 秒检查网络 py 源是否有更新。
-  //   有变化 → 覆盖 imports/py/<key>/<file>.py 并更新 _meta.sha256；
-  //   无变化 → 只更新 _meta.lastCheckedAt。失败仅记日志，不影响启动。
   setTimeout(() => {
     void host.checkPyUpdates().catch((e) => fileLogger.w('py 更新检查失败：' + (e as Error).message));
   }, 10_000);
 
-  // 老板键：注入窗口提供者（主窗口 + 播放器窗口）并按上次设置注册全局快捷键
   bossKey.start(() => {
     const ws: BrowserWindow[] = [];
     if (mainWindow && !mainWindow.isDestroyed()) ws.push(mainWindow);
@@ -347,17 +285,26 @@ app.whenReady().then(async () => {
     return ws;
   });
   bossKey.apply();
-  // ★ 关闭播放器窗口 → 删除本次夸克转存落盘文件（观看进度保留在本地历史）
   onPlayerWindowClosed(() => {
     void host.quarkDeletePending().catch(() => undefined);
   });
-  // ★ 启动时清理上次遗留的夸克落盘文件（此前关闭/退出未删成功的）
   void host.quarkDeletePending().catch(() => undefined);
   createWindow();
-  // ★ 启动时自动订阅刷新（≥7 天一次，静默后台执行，失败仅记日志）
+
+  // ★ 2026-11-13（用户要求「软件开启就校验网络直播源」）：窗口创建后 300ms 开始校验，
+  //   不阻塞首屏；有变化 → 主进程重新导入 + 广播 payload，LivePage 收到后做精细 diff
+  //   （名字变了只刷新 UI、URL 变了重播、频道没了保留旧地址继续播）。
+  setTimeout(() => {
+    void checkAndUpdateSubscriptions()
+      .then((r) => {
+        if (r.updated > 0 || r.failed > 0) {
+          fileLogger.i(`[LiveSub] 启动自动检查：更新 ${r.updated} · 跳过 ${r.skipped} · 失败 ${r.failed}`);
+        }
+      })
+      .catch((e) => fileLogger.w(`[LiveSub] 启动自动检查异常：${(e as Error).message}`));
+  }, 300);
+
   void host.maybeAutoRefreshSubscriptions();
-  // ★ 启动时把已绑定网盘凭据同步为 jar 系期望的 cookie 文件（%TEMP% 可能被系统清理；
-  //   缺失会让 Pizazz 系源的详情播放列表被降级为空 / fty 系取流失败）
   try { host.syncDriveFiles(); } catch { /* 同步失败不影响启动 */ }
 
   app.on('activate', () => {
@@ -370,12 +317,8 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
 
-// ★ 退出前彻底清理：terminate 所有 JVM 蜘蛛子进程 + 停本地代理 + 断 token 解码，
-//   确保关闭应用后无任何后台残留进程/服务（含 Electron 隐含子进程会在 app.quit 后自行结束）。
 let quitCleanupStarted = false;
 app.on('will-quit', (event) => {
-  // will-quit 不会等待普通 async 回调；先阻止退出，给待清理的网盘目录一次有限时长的
-  // 删除机会，避免窗口关闭后马上退出导致“播完即删”只写入队列却未发出请求。
   if (!quitCleanupStarted) {
     quitCleanupStarted = true;
     event.preventDefault();
@@ -386,7 +329,6 @@ app.on('will-quit', (event) => {
     return;
   }
   try {
-    // ★ 退出前再尝试一次夸克落盘文件清理（失败会持久化到下次启动重试）
     void host.quarkDeletePending();
   } catch {
     /* ignore */
@@ -397,7 +339,6 @@ app.on('will-quit', (event) => {
     /* ignore */
   }
   try {
-    // ★ 2026-09-29：停 BT 引擎（回收到 win-quit 这一步，保证不留 aria2c 孤儿进程）
     torrent.dispose();
   } catch {
     /* ignore */
@@ -409,12 +350,10 @@ app.on('will-quit', (event) => {
   }
 });
 
-// 兜底：若 did-fail-load 或异常，也让 JVM 子进程不残留
 process.on('beforeExit', () => {
   try { host.dispose(); } catch { /* ignore */ }
 });
 
-// 单实例锁
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
