@@ -125,7 +125,11 @@ declare global {
         openExternal: (a: { url: string; path?: string; seek?: number }) => Promise<IpcResult<{ ok: boolean; player?: string; error?: string }>>;
       };
       live: {
-        load: (index: number) => Promise<IpcResult<{ groups: LiveGroup[]; liveName: string }>>;
+        /**
+         * ★ 2026-11-13（用户要求）：opts.forceRefresh —— 订阅源更新后绕过 SpiderHost 的
+         *   5 分钟内存缓存，拿到真实新 groups + 新 EPG URL。旧调用 `load(index)` 兼容。
+         */
+        load: (index: number, opts?: { forceRefresh?: boolean }) => Promise<IpcResult<{ groups: LiveGroup[]; liveName: string }>>;
         meta: () => Promise<IpcResult<LiveBean[]>>;
         /** ★ 2026-09-29 EPG：传入该线路的频道引用，返回各键（tvg-id/tvg-name/频道名）的「当前 / 下一档」 */
         epg: (index: number, channels: EpgChannelRef[]) => Promise<IpcResult<LiveEpgResult>>;
@@ -395,7 +399,11 @@ export const client = {
   searchAll: (wd: string, opts?: { refresh?: boolean }) => unwrap(window.api.vod.searchAll(wd, opts)),
   onSearchAllProgress: (cb: (ev: SearchAllProgressEvent) => void) => window.api.vod.onSearchAllProgress(cb as (ev: unknown) => void),
   play: (a: { key: string; flag: string; id: string }) => unwrap(window.api.vod.play(a)),
-  loadLive: (index: number) => unwrap(window.api.live.load(index)),
+  /**
+   * ★ 2026-11-13（用户要求）：opts.forceRefresh —— 订阅源更新后绕过 SpiderHost 的 5 分钟
+   *   内存缓存，拿到真实新 groups + 新 EPG URL。旧调用 `loadLive(index)` 兼容。
+   */
+  loadLive: (index: number, opts?: { forceRefresh?: boolean }) => unwrap(window.api.live.load(index, opts)),
   liveMeta: () => unwrap(window.api.live.meta()),
   liveEpg: (index: number, channels: EpgChannelRef[]) => unwrap(window.api.live.epg(index, channels)),
   /** ★ EPG 直查：支持单 key 或多 key 数组（推荐传 `[tvg-id, tvg-name, name]` 依次尝试） */
